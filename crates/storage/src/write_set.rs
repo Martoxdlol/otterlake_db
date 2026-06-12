@@ -9,9 +9,12 @@ pub struct CollectionWriteSet {
     pub deleted_keys: Vec<Vec<u8>>,
     /// Index entries to be inserted or updated (index id + serialized index key + document id)
     pub index_entries: Vec<(IndexId, Vec<u8>, DocumentId)>,
+    /// Metadata of collection
+    pub metadata: Option<Vec<u8>>,
 }
 
 /// Set of changes to be applied to the database
 pub struct WriteSet {
     pub collections: HashMap<CollectionId, CollectionWriteSet>,
+    pub new_collections: Vec<(CollectionId, String)>,
 }

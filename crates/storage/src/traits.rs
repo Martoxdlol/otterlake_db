@@ -4,17 +4,17 @@ use crate::{
     write_set::WriteSet,
 };
 
-pub trait DatabaseStorageCursor {
+pub trait DatastoreCursor {
     /// Returns next document id + document value
     fn next(&mut self) -> Option<(DocumentId, Value)>;
 }
 
-pub trait DatabaseStorageInsertCursor {
+pub trait DatastoreIndexCursor {
     /// Returns next index entry value + document id
     fn next(&mut self) -> Option<(Value, DocumentId)>;
 }
 
-pub trait DatabaseStorageTransaction {
+pub trait DatastoreTransaction {
     /// Get collection id by name
     fn collection(&self, name: &str) -> Result<Option<CollectionId>>;
 
@@ -27,7 +27,7 @@ pub trait DatabaseStorageTransaction {
         key: DocumentId,
         direction: Direction,
         exclude_start: bool,
-    ) -> Result<impl DatabaseStorageCursor>;
+    ) -> Result<impl DatastoreCursor>;
 
     fn get_index_cursor(
         &self,
@@ -35,12 +35,12 @@ pub trait DatabaseStorageTransaction {
         key: DocumentId,
         direction: Direction,
         exclude_start: bool,
-    ) -> Result<impl DatabaseStorageCursor>;
+    ) -> Result<impl DatastoreIndexCursor>;
 }
 
-pub trait DatabaseStorage {
+pub trait Datastore: Clone + Send + Sync {
     /// Starts a read transaction from version
-    fn transaction(&self, version: u64) -> Result<impl DatabaseStorageTransaction>;
+    fn transaction(&self, version: u64) -> Result<impl DatastoreTransaction>;
 
     /// Apply a set of changes (will be immediately visible to new transactions)
     fn put(&self, batch: WriteSet) -> Result<()>;
