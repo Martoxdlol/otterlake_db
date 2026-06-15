@@ -1,62 +1,34 @@
 # Storage Engine
 
-This crate handles low level document storage, indexing and catalog.
+This crate handles low level document storage, catalog and indexes. It does not handle document indexing/sync. It is not document shape aware, it is just a binary store with a few primitives. It is timestamp aware, allowing to read documents as of a specific timestamp for MVCC.
 
-## Docstore
+## Read transactions
 
-Primitives:
-- store document to a btree/collection
-- retrieve document from a btree/collection
-- delete document from a btree/collection
-- iterate/stream documents from a btree/collection starting from a given key (inclusive or exclusive) in one direction (forward or backward) and with a given batch size.
+Allows to read documents under a specific TS, scan forward and backward, and read the catalog. It is a snapshot of the database at a specific point in time, it is not affected by concurrent write transactions.
 
-## Indexes
+## Write transactions
 
-Create a index over a collection and a field.
+It doesn't handle any time of interactive write transactions, it just allows for a single batch write. Depending on the implementation writes may be atomic, but it is not a guarantee. We can work around this by using versioned documents using the timestamp.
 
-Primitives:
-- insert document to a index
-- delete document from a index
-- query index with a value and get the corresponding document ids
-- iterate/stream index entries starting from a given key (inclusive or exclusive) in one direction (forward or backward) and with a given batch size.
+## Implementations
 
-## Catalog
+The storage module defines a specific interface, the default implementation is based on LMDB using the `heed` crate. 
 
-Keep track of collections and indexes.
+## LMDB databases
 
-Primitives:
-- create collection
-- delete collection
-- create index
-- delete index
-- get collection info (name, indexes, etc)
-- get index info (name, collection, field, etc)
-- list collections
-- list indexes
+### Indexes catalog
 
-# Low level storage structure
+Catalog of existing indexes with config/metadata (opaque to this layer).
 
-For LMDB databases.
+Format: `[collection id: u64][index name: string] -> [id: u64][index config (opaque)]`
 
-## Catalog
+### Collections catalog
 
-Key structure `[entity_type: 1 byte][entity name]`
+Catalog of collections.
 
-Entity types:
-- `0x01` collection
-- `0x02` index
+Format: `[collection name: string] -> [id: u64][collection config (opaque)]`
 
-Value: `[id: 64bits][metadata]`
-
-Max collection name length: 255 bytes.
-
-## Documents
-
-Key structure `[collection_id: 64bits][document_id: 128bits uuid]`
-
-Value: document data (jsonb)
-
-## Indexes
+### Index entries
 
 Here is where the fun start.
 
@@ -78,3 +50,9 @@ Structure:
 - Last segment of a chain: `[0x01][chain id][entry][doc id] -> (empty)`
 
 Initial and middle segments can be reused by multiple entries. Hot paths can be cached in memory.
+
+### Documents
+
+The documents themselves, stored as binary blobs.
+
+Format: `[collection id: u64][doc id: u128][timestamp: u64] -> [document (opaque)]`

@@ -10,3 +10,9 @@ pub enum Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+impl From<heed3::Error> for Error {
+    fn from(e: heed3::Error) -> Self {
+        Self::Other(Box::new(e))
+    }
+}

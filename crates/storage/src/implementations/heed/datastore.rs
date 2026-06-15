@@ -4,8 +4,7 @@ use heed3::Database;
 use heed3::Env;
 use heed3::types::Bytes;
 
-use crate::implementations::heed::transaction::HeedDatastoreTransaction;
-use crate::traits::Datastore;
+use crate::{implementations::heed::transaction::HeedDatastoreTransaction, traits::Datastore};
 
 #[derive(Clone)]
 pub struct HeedStorageEngine {
@@ -17,15 +16,18 @@ pub struct HeedStorageEngine {
     collections_catalog: Database<String, Bytes>,
     /// Each index entry for all docs
     index_entries: Database<Bytes, Bytes>,
-    /// Maps every document id to the entries in index_entries (for cleaning up)
-    index_tracking: Database<Bytes, Bytes>,
     /// Documents themselves
     documents: Database<Bytes, Bytes>,
 }
 
 impl Datastore for HeedStorageEngine {
-    fn transaction(&self, version: u64) -> crate::error::Result<HeedDatastoreTransaction> {
-        todo!()
+    fn transaction(
+        &self,
+        ts: u64,
+    ) -> crate::error::Result<impl crate::traits::DatastoreTransaction + '_> {
+        let tx = self.env.read_txn()?;
+
+        Ok(HeedDatastoreTransaction::new(&self.env, tx, ts))
     }
 
     fn put(&self, batch: crate::write_set::WriteSet) -> crate::error::Result<()> {

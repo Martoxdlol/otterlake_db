@@ -3,9 +3,19 @@ use crate::{
     traits::DatastoreTransaction,
 };
 
-pub struct HeedDatastoreTransaction {}
+pub struct HeedDatastoreTransaction<'env> {
+    env: &'env heed3::Env,
+    tx: heed3::RoTxn<'env, heed3::WithTls>,
+    ts: u64,
+}
 
-impl DatastoreTransaction for HeedDatastoreTransaction {
+impl<'env> HeedDatastoreTransaction<'env> {
+    pub fn new(env: &'env heed3::Env, tx: heed3::RoTxn<'env, heed3::WithTls>, ts: u64) -> Self {
+        Self { env, tx, ts }
+    }
+}
+
+impl DatastoreTransaction for HeedDatastoreTransaction<'_> {
     fn collection(&self, name: &str) -> crate::error::Result<Option<crate::types::CollectionId>> {
         todo!()
     }

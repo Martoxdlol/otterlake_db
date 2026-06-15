@@ -40,7 +40,7 @@ pub trait DatastoreTransaction {
 
 pub trait Datastore: Clone + Send + Sync {
     /// Starts a read transaction from version
-    fn transaction(&self, version: u64) -> Result<impl DatastoreTransaction>;
+    fn transaction(&self, version: u64) -> Result<impl DatastoreTransaction + '_>;
 
     /// Apply a set of changes (will be immediately visible to new transactions)
     fn put(&self, batch: WriteSet) -> Result<()>;
