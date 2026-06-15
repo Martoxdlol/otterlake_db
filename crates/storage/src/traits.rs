@@ -36,6 +36,19 @@ pub trait DatastoreTransaction {
         direction: Direction,
         exclude_start: bool,
     ) -> Result<impl DatastoreIndexCursor>;
+
+    fn get_collections_catalog_cursor(
+        &self,
+        name: &str,
+        direction: Direction,
+    ) -> Result<impl DatastoreCursor>;
+
+    fn get_indexes_catalog_cursor(
+        &self,
+        collection: CollectionId,
+        name: &str,
+        direction: Direction,
+    ) -> Result<impl DatastoreCursor>;
 }
 
 pub trait Datastore: Clone + Send + Sync {
@@ -44,10 +57,6 @@ pub trait Datastore: Clone + Send + Sync {
 
     /// Apply a set of changes (will be immediately visible to new transactions)
     fn put(&self, batch: WriteSet) -> Result<()>;
-
-    /// Create a index with opaque configuration
-    /// It does NOT auto index existing documents
-    fn create_index(&self, collection: CollectionId, name: &str, config: Value) -> Result<()>;
 
     /// Flushes all pending changes to disk
     fn flush(&self) -> Result<()>;

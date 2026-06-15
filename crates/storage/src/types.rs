@@ -8,7 +8,7 @@ pub type DocumentId = u128;
 pub type CollectionId = i64;
 
 /// Auto incrementing id
-pub type IndexId = u64;
+pub type IndexId = i64;
 
 // Arbitrary binary data
 pub type Value = Vec<u8>;

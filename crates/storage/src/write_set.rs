@@ -17,4 +17,6 @@ pub struct CollectionWriteSet {
 pub struct WriteSet {
     pub collections: HashMap<CollectionId, CollectionWriteSet>,
     pub new_collections: Vec<(CollectionId, String)>,
+    pub new_indexes: Vec<(CollectionId, IndexId, String)>,
+    pub ts: u64,
 }

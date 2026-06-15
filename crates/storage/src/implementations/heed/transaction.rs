@@ -54,4 +54,21 @@ impl DatastoreTransaction for HeedDatastoreTransaction<'_> {
     ) -> crate::error::Result<HeedDatastoreIndexCursor> {
         todo!()
     }
+
+    fn get_collections_catalog_cursor(
+        &self,
+        name: &str,
+        direction: crate::types::Direction,
+    ) -> crate::error::Result<HeedDatastoreCursor> {
+        todo!()
+    }
+
+    fn get_indexes_catalog_cursor(
+        &self,
+        collection: crate::types::CollectionId,
+        name: &str,
+        direction: crate::types::Direction,
+    ) -> crate::error::Result<HeedDatastoreCursor> {
+        todo!()
+    }
 }
