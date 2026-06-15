@@ -1,17 +1,24 @@
 use crate::{
-    implementations::heed::cursors::{HeedDatastoreCursor, HeedDatastoreIndexCursor},
+    implementations::heed::{
+        cursors::{HeedDatastoreCursor, HeedDatastoreIndexCursor},
+        datastore::HeedStorageEngine,
+    },
     traits::DatastoreTransaction,
 };
 
 pub struct HeedDatastoreTransaction<'env> {
-    env: &'env heed3::Env,
+    engine: &'env HeedStorageEngine,
     tx: heed3::RoTxn<'env, heed3::WithTls>,
     ts: u64,
 }
 
 impl<'env> HeedDatastoreTransaction<'env> {
-    pub fn new(env: &'env heed3::Env, tx: heed3::RoTxn<'env, heed3::WithTls>, ts: u64) -> Self {
-        Self { env, tx, ts }
+    pub fn new(
+        engine: &'env HeedStorageEngine,
+        tx: heed3::RoTxn<'env, heed3::WithTls>,
+        ts: u64,
+    ) -> Self {
+        Self { engine, tx, ts }
     }
 }
 
