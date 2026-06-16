@@ -48,6 +48,62 @@ pub trait DatastoreTransaction {
         start: CursorStart<String>,
         direction: Direction,
     ) -> Result<impl DatastoreCursor<Item = IndexCatalogEntry>>;
+
+    fn put(&mut self, collection_id: CollectionId, key: DocumentId, value: Value) -> Result<()>;
+
+    fn put_many(
+        &mut self,
+        collection_id: CollectionId,
+        documents: Vec<(DocumentId, Value)>,
+    ) -> Result<()>;
+
+    fn put_index_entry(
+        &mut self,
+        collection_id: CollectionId,
+        index_id: IndexId,
+        key: Value,
+        document_id: DocumentId,
+    ) -> Result<()>;
+
+    fn put_index_entries(
+        &mut self,
+        collection_id: CollectionId,
+        entries: Vec<(IndexId, Value, DocumentId)>,
+    ) -> Result<()>;
+
+    fn delete(&mut self, collection_id: CollectionId, key: DocumentId) -> Result<()>;
+
+    fn delete_many(&mut self, collection_id: CollectionId, keys: Vec<DocumentId>) -> Result<()>;
+
+    fn delete_index_entry(
+        &mut self,
+        collection_id: CollectionId,
+        index_id: IndexId,
+        key: Value,
+        document_id: DocumentId,
+    ) -> Result<()>;
+
+    fn delete_index_entries(
+        &mut self,
+        collection_id: CollectionId,
+        entries: Vec<(IndexId, Value, DocumentId)>,
+    ) -> Result<()>;
+
+    fn new_collection(&mut self, collection_id: CollectionId, name: String) -> Result<()>;
+
+    fn new_index(
+        &mut self,
+        collection_id: CollectionId,
+        index_id: IndexId,
+        name: String,
+        metadata: Value,
+    ) -> Result<()>;
+
+    fn update_collection_metadata(
+        &mut self,
+        collection_id: CollectionId,
+        metadata: Value,
+    ) -> Result<()>;
 }
 
 pub trait Datastore: Clone + Send + Sync {
