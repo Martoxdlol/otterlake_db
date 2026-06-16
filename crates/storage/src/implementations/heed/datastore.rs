@@ -8,7 +8,9 @@ use heed3::EnvOpenOptions;
 use heed3::RwTxn;
 use heed3::types::{Bytes, Str};
 
-use crate::implementations::heed::encoding::decode_u64;
+use crate::implementations::heed::encoding::{
+    decode_u64, encode_document_key, encode_vacuum_target_key,
+};
 use crate::{
     implementations::heed::transaction::HeedDatastoreTransaction,
     traits::Datastore,
@@ -34,13 +36,15 @@ pub struct HeedStorageEngine {
     /// Catalog of index names to index ids + config
     pub(super) indexes_catalog: Database<Bytes, Bytes>,
     /// Catalog of collection names to collection ids + metadata
-    pub(super) collections_catalog: Database<Str, Bytes>,
+    pub(super) collections_catalog: Database<Bytes, Bytes>,
     /// Each index entry for all docs
     pub(super) index_entries: Database<Bytes, Bytes>,
     /// Documents themselves
     pub(super) documents: Database<Bytes, Bytes>,
     /// Metadata database (e.g. for global timestamp counter)
     pub(super) metadata: Database<Bytes, Bytes>,
+    /// Vacuum targets (documents with previous versions to be vacuumed and related index entries)
+    pub(super) vacuum_targets: Database<Bytes, Bytes>,
 
     // counters
     pub(super) ts: Arc<AtomicU64>,
@@ -88,7 +92,7 @@ impl HeedStorageEngine {
         let index_entries = env.create_database(&mut wtxn, Some("index_entries"))?;
         let documents = env.create_database(&mut wtxn, Some("documents"))?;
         let metadata = env.create_database(&mut wtxn, Some("metadata"))?;
-
+        let vacuum_targets = env.create_database(&mut wtxn, Some("vacuum_targets"))?;
         // load counters
 
         wtxn.commit()?;
@@ -100,6 +104,7 @@ impl HeedStorageEngine {
             index_entries,
             documents,
             metadata,
+            vacuum_targets,
             ts: Arc::new(AtomicU64::new(0)),
             ts_changed: Arc::new(AtomicBool::new(false)),
             collection_id_counter: Arc::new(AtomicU64::new(0)),
@@ -254,6 +259,16 @@ impl HeedStorageEngine {
     ) -> crate::error::Result<CollectionId> {
         todo!()
     }
+
+    fn create_index(
+        &self,
+        tx: &mut RwTxn,
+        collection_id: CollectionId,
+        index_name: &str,
+        index_config: &[u8],
+    ) -> crate::error::Result<IndexId> {
+        todo!()
+    }
 }
 
 impl Datastore for HeedStorageEngine {
@@ -277,6 +292,27 @@ impl Datastore for HeedStorageEngine {
             new_collections.insert(new_collection_tmp_id, new_collection_id);
         }
 
+        let mut new_indexes = HashMap::<IndexId, IndexId>::new();
+
+        for (collection_id, new_index_tmp_id, name, data) in batch.new_indexes {
+            let collection_id: CollectionId = if collection_id < 0 {
+                new_collections
+                    .get(&(collection_id as CollectionId))
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::error::Error::implementation(format!(
+                            "invalid collection id {} for new index in batch",
+                            collection_id
+                        ))
+                    })?
+            } else {
+                collection_id as CollectionId
+            };
+
+            let new_index_id = self.create_index(&mut wtxn, collection_id, &name, &data)?;
+            new_indexes.insert(new_index_tmp_id, new_index_id);
+        }
+
         for (collection_id, data) in batch.collections {
             let collection_id: CollectionId = if collection_id < 0 {
                 new_collections
@@ -291,9 +327,36 @@ impl Datastore for HeedStorageEngine {
             } else {
                 collection_id as CollectionId
             };
+
+            for (document_id, data) in data.documents {
+                let key = encode_document_key(collection_id, document_id, batch.ts);
+                let value = [vec![DOCUMENT_VALUE_PREFIX], data].concat();
+                self.documents.put(&mut wtxn, &key, &value)?;
+                let vacuum_key = encode_vacuum_target_key(collection_id, document_id);
+                self.vacuum_targets.put(&mut wtxn, &vacuum_key, &[])?;
+            }
+
+            for document_id in data.deleted_keys {
+                let key = encode_document_key(collection_id, document_id, batch.ts);
+                self.documents.put(&mut wtxn, &key, DOCUMENT_TOMBSTONE)?;
+                let vacuum_key = encode_vacuum_target_key(collection_id, document_id);
+                self.vacuum_targets.put(&mut wtxn, &vacuum_key, &[])?;
+            }
+
+            for (index_id, index_key, document_id) in data.index_entries {
+                todo!("put index entry following README's logic")
+            }
+
+            for (index_id, index_key, document_id) in data.deleted_index_entries {
+                todo!("delete index entry following README's logic")
+            }
+
+            // update meta in collections catalog
         }
 
-        todo!()
+        wtxn.commit()?;
+
+        Ok(())
     }
 
     fn flush(&self) -> crate::error::Result<()> {

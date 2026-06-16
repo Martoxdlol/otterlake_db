@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::{CollectionId, DocumentId, IndexId};
+use crate::types::{CollectionId, DocumentId, IndexId, Value};
 
 pub struct CollectionWriteSet {
     /// Documents to be inserted or updated (document id + serialized document)
@@ -19,6 +19,6 @@ pub struct CollectionWriteSet {
 pub struct WriteSet {
     pub collections: HashMap<CollectionId, CollectionWriteSet>,
     pub new_collections: Vec<(CollectionId, String)>,
-    pub new_indexes: Vec<(CollectionId, IndexId, String)>,
-    pub ts: Option<u64>,
+    pub new_indexes: Vec<(CollectionId, IndexId, String, Value)>,
+    pub ts: u64,
 }

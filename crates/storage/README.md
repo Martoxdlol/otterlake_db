@@ -56,3 +56,8 @@ Initial and middle segments can be reused by multiple entries. Hot paths can be 
 The documents themselves, stored as binary blobs.
 
 Format: `[collection id: u64][doc id: u128][timestamp: u64] -> [document (opaque)]`
+
+### Vacuum targets
+
+When we crate a new version of a document (a insert or delete), we add a entry to a vacuum list so we can later
+clean up old versions without full table scans.
