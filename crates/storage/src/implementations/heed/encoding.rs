@@ -5,6 +5,7 @@ use crate::types::{CollectionId, DocumentId, IndexId, Value};
 pub const I64_LEN: usize = 8;
 pub const U64_LEN: usize = 8;
 pub const U128_LEN: usize = 16;
+pub const COLLECTION_CATALOG_KEY_LEN: usize = I64_LEN + U64_LEN;
 pub const DOCUMENT_KEY_LEN: usize = I64_LEN + U128_LEN + U64_LEN;
 pub const DOCUMENT_PREFIX_LEN: usize = I64_LEN + U128_LEN;
 pub const DOCUMENT_TOMBSTONE: &[u8] = &[0x00];
@@ -26,24 +27,52 @@ pub fn decode_u128(bytes: &[u8]) -> crate::error::Result<u128> {
     Ok(u128::from_be_bytes(fixed(bytes, "stored u128 value")?))
 }
 
-pub fn encode_collection_catalog_value(id: CollectionId, metadata: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(I64_LEN + metadata.len());
-    bytes.extend_from_slice(&id.to_be_bytes());
+pub fn encode_collection_catalog_key(collection_id: CollectionId, version: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(COLLECTION_CATALOG_KEY_LEN);
+    bytes.extend_from_slice(&collection_id.to_be_bytes());
+    bytes.extend_from_slice(&version.to_be_bytes());
+    bytes
+}
+
+pub fn decode_collection_catalog_key(bytes: &[u8]) -> crate::error::Result<(CollectionId, u64)> {
+    if bytes.len() != COLLECTION_CATALOG_KEY_LEN {
+        return Err(invalid_data("collection catalog key is not 16 bytes"));
+    }
+
+    let collection_id = decode_i64(&bytes[..I64_LEN])?;
+    let version = decode_u64(&bytes[I64_LEN..])?;
+    Ok((collection_id, version))
+}
+
+pub fn encode_collection_catalog_value(name: &str, metadata: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(U64_LEN + name.len() + metadata.len());
+    bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(name.as_bytes());
     bytes.extend_from_slice(metadata);
     bytes
 }
 
-pub fn decode_collection_catalog_value(
-    bytes: &[u8],
-) -> crate::error::Result<(CollectionId, Value)> {
-    if bytes.len() < I64_LEN {
+pub fn decode_collection_catalog_value(bytes: &[u8]) -> crate::error::Result<(String, Value)> {
+    if bytes.len() < U64_LEN {
         return Err(invalid_data(
             "collection catalog value is shorter than 8 bytes",
         ));
     }
 
-    let id = decode_i64(&bytes[..I64_LEN])?;
-    Ok((id, bytes[I64_LEN..].to_vec()))
+    let name_len = decode_u64(&bytes[..U64_LEN])? as usize;
+    let name_end = U64_LEN
+        .checked_add(name_len)
+        .ok_or_else(|| invalid_data("collection catalog name length overflows"))?;
+    if bytes.len() < name_end {
+        return Err(invalid_data(
+            "collection catalog value is shorter than encoded name length",
+        ));
+    }
+
+    Ok((
+        decode_utf8(&bytes[U64_LEN..name_end])?,
+        bytes[name_end..].to_vec(),
+    ))
 }
 
 pub fn encode_index_catalog_key(collection_id: CollectionId, name: &str) -> Vec<u8> {
@@ -215,6 +244,21 @@ mod tests {
     fn document_keys_round_trip() {
         let key = encode_document_key(7, 42, 99);
         assert_eq!(decode_document_key(&key).unwrap(), (7, 42, 99));
+    }
+
+    #[test]
+    fn collection_catalog_keys_round_trip() {
+        let key = encode_collection_catalog_key(7, 42);
+        assert_eq!(decode_collection_catalog_key(&key).unwrap(), (7, 42));
+    }
+
+    #[test]
+    fn collection_catalog_values_round_trip() {
+        let value = encode_collection_catalog_value("a\0b", b"metadata");
+        assert_eq!(
+            decode_collection_catalog_value(&value).unwrap(),
+            ("a\0b".to_owned(), b"metadata".to_vec())
+        );
     }
 
     #[test]

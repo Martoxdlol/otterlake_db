@@ -5,11 +5,12 @@ use heed3::types::Bytes;
 use heed3::{Database, DatabaseFlags, Env, EnvFlags, EnvOpenOptions, RwTxn, WithoutTls};
 
 use crate::implementations::heed::encoding::{
-    DOCUMENT_TOMBSTONE, ROOT_INDEX_CHAIN_ID, decode_collection_catalog_value,
-    decode_index_catalog_value, decode_u64, decode_utf8, encode_collection_catalog_value,
-    encode_document_key, encode_document_value, encode_index_catalog_key,
-    encode_index_catalog_value, encode_index_document_id, encode_index_node_key,
-    encode_vacuum_target_key, index_node_prefix, split_index_key,
+    DOCUMENT_TOMBSTONE, ROOT_INDEX_CHAIN_ID, decode_collection_catalog_key,
+    decode_collection_catalog_value, decode_i64, decode_index_catalog_value, decode_u64,
+    encode_collection_catalog_key, encode_collection_catalog_value, encode_document_key,
+    encode_document_value, encode_index_catalog_key, encode_index_catalog_value,
+    encode_index_document_id, encode_index_node_key, encode_vacuum_target_key, index_node_prefix,
+    split_index_key,
 };
 use crate::{
     error::Error,
@@ -30,8 +31,10 @@ pub struct HeedStorageEngine {
     pub(super) env: Arc<Env<WithoutTls>>,
     /// Catalog of index names to index ids + config
     pub(super) indexes_catalog: Database<Bytes, Bytes>,
-    /// Catalog of collection names to collection ids + metadata
+    /// Catalog of collection ids to timestamped names + metadata.
     pub(super) collections_catalog: Database<Bytes, Bytes>,
+    /// Secondary lookup from collection name to collection id.
+    pub(super) collection_ids_by_name: Database<Bytes, Bytes>,
     /// Index trie edges: `[index id][parent chain id][segment] -> [child chain id]`.
     pub(super) index_edges: Database<Bytes, Bytes>,
     /// Index trie leaves: `[index id][parent chain id][segment] -> duplicate sorted document ids`.
@@ -83,6 +86,8 @@ impl HeedStorageEngine {
 
         let indexes_catalog = env.create_database(&mut wtxn, Some("indexes_catalog"))?;
         let collections_catalog = env.create_database(&mut wtxn, Some("collections_catalog"))?;
+        let collection_ids_by_name =
+            env.create_database(&mut wtxn, Some("collection_ids_by_name"))?;
         let index_edges = env.create_database(&mut wtxn, Some("index_edges"))?;
         let index_leaves = env
             .database_options()
@@ -98,6 +103,7 @@ impl HeedStorageEngine {
             env: Arc::clone(&env),
             indexes_catalog,
             collections_catalog,
+            collection_ids_by_name,
             index_edges,
             index_leaves,
             documents,
@@ -248,25 +254,72 @@ impl HeedStorageEngine {
         tx: &mut RwTxn,
         collection_name: &str,
         metadata: Option<&[u8]>,
+        version: u64,
     ) -> crate::error::Result<CollectionId> {
-        if let Some(value) = self
-            .collections_catalog
-            .get(tx, collection_name.as_bytes())?
-        {
-            let (id, _) = decode_collection_catalog_value(value)?;
+        if let Some(id) = self.collection_id_by_name(tx, collection_name)? {
             if let Some(metadata) = metadata {
-                let value = encode_collection_catalog_value(id, metadata);
-                self.collections_catalog
-                    .put(tx, collection_name.as_bytes(), &value)?;
+                self.put_collection_catalog_entry(tx, id, collection_name, metadata, version)?;
             }
             return Ok(id);
         }
 
         let id = self.allocate_collection_id();
-        let value = encode_collection_catalog_value(id, metadata.unwrap_or_default());
-        self.collections_catalog
-            .put(tx, collection_name.as_bytes(), &value)?;
+        self.put_collection_catalog_entry(
+            tx,
+            id,
+            collection_name,
+            metadata.unwrap_or_default(),
+            version,
+        )?;
+        self.put_collection_id_by_name(tx, collection_name, id)?;
         Ok(id)
+    }
+
+    fn collection_id_by_name(
+        &self,
+        tx: &RwTxn,
+        collection_name: &str,
+    ) -> crate::error::Result<Option<CollectionId>> {
+        self.collection_ids_by_name
+            .get(tx, collection_name.as_bytes())?
+            .map(decode_i64)
+            .transpose()
+    }
+
+    fn collection_by_id(
+        &self,
+        tx: &RwTxn,
+        collection_id: CollectionId,
+        version: u64,
+    ) -> crate::error::Result<Option<(String, Value)>> {
+        let upper_key = encode_collection_catalog_key(collection_id, version);
+        let Some((stored_key, value)) = self
+            .collections_catalog
+            .get_lower_than_or_equal_to(tx, &upper_key)?
+        else {
+            return Ok(None);
+        };
+
+        let (stored_collection_id, stored_version) = decode_collection_catalog_key(stored_key)?;
+        if stored_collection_id != collection_id || stored_version > version {
+            return Ok(None);
+        }
+
+        decode_collection_catalog_value(value).map(Some)
+    }
+
+    fn put_collection_catalog_entry(
+        &self,
+        tx: &mut RwTxn,
+        collection_id: CollectionId,
+        collection_name: &str,
+        metadata: &[u8],
+        version: u64,
+    ) -> crate::error::Result<()> {
+        let key = encode_collection_catalog_key(collection_id, version);
+        let value = encode_collection_catalog_value(collection_name, metadata);
+        self.collections_catalog.put(tx, &key, &value)?;
+        Ok(())
     }
 
     fn create_index(
@@ -293,30 +346,29 @@ impl HeedStorageEngine {
         tx: &mut RwTxn,
         collection_id: CollectionId,
         metadata: &[u8],
+        version: u64,
     ) -> crate::error::Result<()> {
-        let name = self
-            .collection_name_by_id(tx, collection_id)?
+        let (name, _) = self
+            .collection_by_id(tx, collection_id, u64::MAX)?
             .ok_or_else(|| {
                 Error::implementation(format!("collection id {collection_id} does not exist"))
             })?;
-        let value = encode_collection_catalog_value(collection_id, metadata);
-        self.collections_catalog.put(tx, name.as_bytes(), &value)?;
+        self.put_collection_catalog_entry(tx, collection_id, &name, metadata, version)?;
         Ok(())
     }
 
-    fn collection_name_by_id(
+    fn put_collection_id_by_name(
         &self,
-        tx: &RwTxn,
+        tx: &mut RwTxn,
+        collection_name: &str,
         collection_id: CollectionId,
-    ) -> crate::error::Result<Option<String>> {
-        for row in self.collections_catalog.iter(tx)? {
-            let (key, value) = row?;
-            let (id, _) = decode_collection_catalog_value(value)?;
-            if id == collection_id {
-                return Ok(Some(decode_utf8(key)?));
-            }
-        }
-        Ok(None)
+    ) -> crate::error::Result<()> {
+        self.collection_ids_by_name.put(
+            tx,
+            collection_name.as_bytes(),
+            &collection_id.to_be_bytes(),
+        )?;
+        Ok(())
     }
 
     fn put_index_entry(
@@ -433,7 +485,7 @@ impl Datastore for HeedStorageEngine {
 
         for (new_collection_tmp_id, new_collection_name) in batch.new_collections {
             let new_collection_id =
-                self.create_collection(&mut wtxn, &new_collection_name, None)?;
+                self.create_collection(&mut wtxn, &new_collection_name, None, batch.ts)?;
             new_collections.insert(new_collection_tmp_id, new_collection_id);
         }
 
@@ -481,7 +533,7 @@ impl Datastore for HeedStorageEngine {
             }
 
             if let Some(metadata) = metadata {
-                self.update_collection_metadata(&mut wtxn, collection_id, &metadata)?;
+                self.update_collection_metadata(&mut wtxn, collection_id, &metadata, batch.ts)?;
             }
         }
 

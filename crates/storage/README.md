@@ -28,7 +28,13 @@ Format: `[collection id: i64][index name: string] -> [index id: i64][index confi
 
 Catalog of collections.
 
-Format: `[collection name: string] -> [collection id: i64][collection config (opaque)]`
+Format: `[collection id: i64][timestamp: u64] -> [collection name length: u64][collection name: string][collection config (opaque)]`
+
+### Collection ids by name
+
+Secondary lookup from collection name to collection id.
+
+Format: `[collection name: string] -> [collection id: i64]`
 
 ### Index entries
 

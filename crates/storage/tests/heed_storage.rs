@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use storage::{
     implementations::heed::datastore::HeedStorageEngine,
     traits::{Datastore, DatastoreCursor, DatastoreTransaction},
-    types::{CollectionId, CursorStart, Direction, IndexEntry, IndexId, IndexPosition},
+    types::{
+        CollectionCatalogEntry, CollectionId, CursorStart, Direction, IndexEntry, IndexId,
+        IndexPosition,
+    },
     write_set::{CollectionWriteSet, WriteSet},
 };
 use tempfile::TempDir;
@@ -129,6 +132,17 @@ fn collect_index(cursor: impl DatastoreCursor<Item = IndexEntry>) -> Vec<IndexEn
     entries
 }
 
+fn collect_collections(
+    cursor: impl DatastoreCursor<Item = CollectionCatalogEntry>,
+) -> Vec<CollectionCatalogEntry> {
+    let mut cursor = cursor;
+    let mut entries = Vec::new();
+    while let Some(entry) = cursor.next().expect("cursor next") {
+        entries.push(entry);
+    }
+    entries
+}
+
 fn index_entries(
     engine: &HeedStorageEngine,
     ts: u64,
@@ -154,6 +168,257 @@ fn entry(value: &[u8], document_id: u128) -> IndexEntry {
         document_id,
         document_value: document_value(document_id),
     }
+}
+
+fn collection_entry(id: CollectionId, name: &str, metadata: &[u8]) -> CollectionCatalogEntry {
+    CollectionCatalogEntry {
+        id,
+        name: name.to_owned(),
+        metadata: metadata.to_vec(),
+    }
+}
+
+#[test]
+fn collection_catalog_is_timestamped() {
+    let (_dir, engine) = open_engine();
+
+    engine
+        .put(WriteSet {
+            collections: HashMap::new(),
+            new_collections: vec![(-1, "docs".to_owned())],
+            new_indexes: Vec::new(),
+            ts: 1,
+        })
+        .expect("create collection");
+
+    let tx = engine.transaction(0).expect("read transaction");
+    assert_eq!(tx.collection("docs").expect("collection lookup"), None);
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(collect_collections(cursor), Vec::new());
+
+    let tx = engine.transaction(1).expect("read transaction");
+    let collection = tx
+        .collection("docs")
+        .expect("collection lookup")
+        .expect("collection exists");
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![collection_entry(collection, "docs", &[])]
+    );
+
+    let mut collections = HashMap::new();
+    collections.insert(
+        collection,
+        CollectionWriteSet {
+            documents: Vec::new(),
+            deleted_keys: Vec::new(),
+            index_entries: Vec::new(),
+            deleted_index_entries: Vec::new(),
+            metadata: Some(b"v2".to_vec()),
+        },
+    );
+    engine
+        .put(WriteSet {
+            collections,
+            new_collections: Vec::new(),
+            new_indexes: Vec::new(),
+            ts: 2,
+        })
+        .expect("update collection metadata");
+
+    let tx = engine.transaction(1).expect("read transaction");
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![collection_entry(collection, "docs", &[])]
+    );
+
+    let tx = engine.transaction(2).expect("read transaction");
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![collection_entry(collection, "docs", b"v2")]
+    );
+}
+
+#[test]
+fn collection_catalog_cursor_scans_name_index_order() {
+    let (_dir, engine) = open_engine();
+
+    engine
+        .put(WriteSet {
+            collections: HashMap::new(),
+            new_collections: vec![
+                (-1, "beta".to_owned()),
+                (-2, "alpha".to_owned()),
+                (-3, "gamma".to_owned()),
+            ],
+            new_indexes: Vec::new(),
+            ts: 1,
+        })
+        .expect("create collections");
+
+    let tx = engine.transaction(1).expect("read transaction");
+    let alpha = tx
+        .collection("alpha")
+        .expect("collection lookup")
+        .expect("alpha exists");
+    let beta = tx
+        .collection("beta")
+        .expect("collection lookup")
+        .expect("beta exists");
+    let gamma = tx
+        .collection("gamma")
+        .expect("collection lookup")
+        .expect("gamma exists");
+
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![
+            collection_entry(alpha, "alpha", &[]),
+            collection_entry(beta, "beta", &[]),
+            collection_entry(gamma, "gamma", &[]),
+        ]
+    );
+
+    let cursor = tx
+        .get_collections_catalog_cursor(
+            CursorStart::Excluded("alpha".to_owned()),
+            Direction::Forward,
+        )
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![
+            collection_entry(beta, "beta", &[]),
+            collection_entry(gamma, "gamma", &[]),
+        ]
+    );
+
+    let cursor = tx
+        .get_collections_catalog_cursor(
+            CursorStart::Included("beta".to_owned()),
+            Direction::Reverse,
+        )
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![
+            collection_entry(beta, "beta", &[]),
+            collection_entry(alpha, "alpha", &[]),
+        ]
+    );
+}
+
+#[test]
+fn collection_metadata_update_uses_persistent_id_lookup() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().to_str().expect("utf-8 temp path").to_owned();
+    let engine = HeedStorageEngine::open(&path).expect("open heed engine");
+
+    engine
+        .put(WriteSet {
+            collections: HashMap::new(),
+            new_collections: vec![(-1, "docs".to_owned())],
+            new_indexes: Vec::new(),
+            ts: 1,
+        })
+        .expect("create collection");
+
+    let tx = engine.transaction(1).expect("read transaction");
+    let collection = tx
+        .collection("docs")
+        .expect("collection lookup")
+        .expect("collection exists");
+    drop(tx);
+    drop(engine);
+
+    let engine = HeedStorageEngine::open(&path).expect("reopen heed engine");
+    let mut collections = HashMap::new();
+    collections.insert(
+        collection,
+        CollectionWriteSet {
+            documents: Vec::new(),
+            deleted_keys: Vec::new(),
+            index_entries: Vec::new(),
+            deleted_index_entries: Vec::new(),
+            metadata: Some(b"after-reopen".to_vec()),
+        },
+    );
+    engine
+        .put(WriteSet {
+            collections,
+            new_collections: Vec::new(),
+            new_indexes: Vec::new(),
+            ts: 2,
+        })
+        .expect("update collection metadata");
+
+    let tx = engine.transaction(2).expect("read transaction");
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![collection_entry(collection, "docs", b"after-reopen")]
+    );
+}
+
+#[test]
+fn index_metadata_is_stored_on_creation_and_not_updated() {
+    let (_dir, engine) = open_engine();
+
+    engine
+        .put(WriteSet {
+            collections: HashMap::new(),
+            new_collections: vec![(-1, "docs".to_owned())],
+            new_indexes: vec![(-1, -1, "by_value".to_owned(), b"v1".to_vec())],
+            ts: 1,
+        })
+        .expect("create collection and index");
+
+    let tx = engine.transaction(1).expect("read transaction");
+    let collection = tx
+        .collection("docs")
+        .expect("collection lookup")
+        .expect("collection exists");
+    let mut indexes = tx
+        .get_indexes_catalog_cursor(collection, CursorStart::Unbounded, Direction::Forward)
+        .expect("index catalog cursor");
+    let created = indexes.next().expect("next index").expect("index exists");
+    assert_eq!(created.name, "by_value");
+    assert_eq!(created.metadata, b"v1".to_vec());
+    assert!(indexes.next().expect("next index").is_none());
+
+    engine
+        .put(WriteSet {
+            collections: HashMap::new(),
+            new_collections: Vec::new(),
+            new_indexes: vec![(collection, -1, "by_value".to_owned(), b"v2".to_vec())],
+            ts: 2,
+        })
+        .expect("recreate existing index");
+
+    let tx = engine.transaction(2).expect("read transaction");
+    let mut indexes = tx
+        .get_indexes_catalog_cursor(collection, CursorStart::Unbounded, Direction::Forward)
+        .expect("index catalog cursor");
+    let current = indexes.next().expect("next index").expect("index exists");
+    assert_eq!(current.id, created.id);
+    assert_eq!(current.metadata, b"v1".to_vec());
+    assert!(indexes.next().expect("next index").is_none());
 }
 
 #[test]

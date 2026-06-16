@@ -8,7 +8,8 @@ use crate::{
         },
         datastore::HeedStorageEngine,
         encoding::{
-            decode_collection_catalog_value, decode_document_key, decode_document_value,
+            decode_collection_catalog_key, decode_collection_catalog_value, decode_document_key,
+            decode_document_value, decode_i64, encode_collection_catalog_key,
             encode_collection_prefix, encode_document_key, encode_index_catalog_key,
         },
     },
@@ -54,12 +55,31 @@ impl<'env> HeedDatastoreTransaction<'env> {
 
 impl DatastoreTransaction for HeedDatastoreTransaction<'_> {
     fn collection(&self, name: &str) -> crate::error::Result<Option<CollectionId>> {
-        self.engine
-            .collections_catalog
+        let Some(value) = self
+            .engine
+            .collection_ids_by_name
             .get(&self.tx, name.as_bytes())?
-            .map(decode_collection_catalog_value)
-            .transpose()
-            .map(|row| row.map(|(id, _)| id))
+        else {
+            return Ok(None);
+        };
+
+        let collection_id = decode_i64(value)?;
+        let upper_key = encode_collection_catalog_key(collection_id, self.ts);
+        let Some((stored_key, value)) = self
+            .engine
+            .collections_catalog
+            .get_lower_than_or_equal_to(&self.tx, &upper_key)?
+        else {
+            return Ok(None);
+        };
+
+        let (stored_collection_id, stored_version) = decode_collection_catalog_key(stored_key)?;
+        if stored_collection_id != collection_id || stored_version > self.ts {
+            return Ok(None);
+        }
+
+        decode_collection_catalog_value(value)?;
+        Ok(Some(collection_id))
     }
 
     fn get(
@@ -127,9 +147,14 @@ impl DatastoreTransaction for HeedDatastoreTransaction<'_> {
         start: CursorStart<String>,
         direction: Direction,
     ) -> crate::error::Result<impl DatastoreCursor<Item = CollectionCatalogEntry>> {
-        let bounds = string_cursor_bounds(start, direction);
-        let raw = self.raw_cursor(self.engine.collections_catalog, bounds, direction)?;
-        Ok(HeedCollectionCatalogCursor::new(raw))
+        let bounds = collection_catalog_cursor_bounds(start, direction);
+        let raw = self.raw_cursor(self.engine.collection_ids_by_name, bounds, direction)?;
+        Ok(HeedCollectionCatalogCursor::new(
+            &self.tx,
+            raw,
+            self.engine.collections_catalog,
+            self.ts,
+        ))
     }
 
     fn get_indexes_catalog_cursor(
@@ -180,19 +205,21 @@ fn document_cursor_bounds(
     }
 }
 
-fn string_cursor_bounds(
+fn collection_catalog_cursor_bounds(
     start: CursorStart<String>,
     direction: Direction,
 ) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     match direction {
-        Direction::Forward => (
-            cursor_start_to_lower_bound(start, String::into_bytes),
-            Bound::Unbounded,
-        ),
-        Direction::Reverse => (
-            Bound::Unbounded,
-            cursor_start_to_upper_bound(start, String::into_bytes),
-        ),
+        Direction::Forward => (string_start_bound(start), Bound::Unbounded),
+        Direction::Reverse => (Bound::Unbounded, string_start_bound(start)),
+    }
+}
+
+fn string_start_bound(start: CursorStart<String>) -> Bound<Vec<u8>> {
+    match start {
+        CursorStart::Unbounded => Bound::Unbounded,
+        CursorStart::Included(name) => Bound::Included(name.into_bytes()),
+        CursorStart::Excluded(name) => Bound::Excluded(name.into_bytes()),
     }
 }
 
@@ -229,28 +256,6 @@ fn index_catalog_cursor_bounds(
             };
             (collection_start, end)
         }
-    }
-}
-
-fn cursor_start_to_lower_bound<T>(
-    start: CursorStart<T>,
-    encode: impl FnOnce(T) -> Vec<u8>,
-) -> Bound<Vec<u8>> {
-    match start {
-        CursorStart::Unbounded => Bound::Unbounded,
-        CursorStart::Included(value) => Bound::Included(encode(value)),
-        CursorStart::Excluded(value) => Bound::Excluded(encode(value)),
-    }
-}
-
-fn cursor_start_to_upper_bound<T>(
-    start: CursorStart<T>,
-    encode: impl FnOnce(T) -> Vec<u8>,
-) -> Bound<Vec<u8>> {
-    match start {
-        CursorStart::Unbounded => Bound::Unbounded,
-        CursorStart::Included(value) => Bound::Included(encode(value)),
-        CursorStart::Excluded(value) => Bound::Excluded(encode(value)),
     }
 }
 

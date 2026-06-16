@@ -1,11 +1,12 @@
 use heed3::types::Bytes;
 
 use crate::{
+    error::Error,
     implementations::heed::encoding::{
-        ROOT_INDEX_CHAIN_ID, decode_collection_catalog_value, decode_document_key,
-        decode_document_value, decode_index_catalog_key, decode_index_catalog_value,
-        decode_index_document_id, decode_index_node_key, decode_u64, decode_utf8,
-        encode_document_key, index_node_prefix,
+        ROOT_INDEX_CHAIN_ID, decode_collection_catalog_key, decode_collection_catalog_value,
+        decode_document_key, decode_document_value, decode_i64, decode_index_catalog_key,
+        decode_index_catalog_value, decode_index_document_id, decode_index_node_key, decode_u64,
+        decode_utf8, encode_collection_catalog_key, encode_document_key, index_node_prefix,
     },
     traits::DatastoreCursor,
     types::{
@@ -123,27 +124,75 @@ struct DecodedDocument {
     value: Option<Value>,
 }
 
-pub(super) struct HeedCollectionCatalogCursor<'txn> {
+pub(super) struct HeedCollectionCatalogCursor<'txn, 'env> {
+    tx: &'txn heed3::RoTxn<'env, heed3::WithoutTls>,
     raw: HeedRawCursor<'txn>,
+    collections_catalog: heed3::Database<Bytes, Bytes>,
+    ts: u64,
 }
 
-impl<'txn> HeedCollectionCatalogCursor<'txn> {
-    pub(super) fn new(raw: HeedRawCursor<'txn>) -> Self {
-        Self { raw }
+impl<'txn, 'env> HeedCollectionCatalogCursor<'txn, 'env> {
+    pub(super) fn new(
+        tx: &'txn heed3::RoTxn<'env, heed3::WithoutTls>,
+        raw: HeedRawCursor<'txn>,
+        collections_catalog: heed3::Database<Bytes, Bytes>,
+        ts: u64,
+    ) -> Self {
+        Self {
+            tx,
+            raw,
+            collections_catalog,
+            ts,
+        }
     }
-}
 
-impl DatastoreCursor for HeedCollectionCatalogCursor<'_> {
-    type Item = CollectionCatalogEntry;
-
-    fn next(&mut self) -> crate::error::Result<Option<Self::Item>> {
-        let Some((key, value)) = self.raw.next_raw()? else {
+    fn visible_collection(
+        &self,
+        collection_id: CollectionId,
+    ) -> crate::error::Result<Option<(String, Value)>> {
+        let upper_key = encode_collection_catalog_key(collection_id, self.ts);
+        let Some((stored_key, value)) = self
+            .collections_catalog
+            .get_lower_than_or_equal_to(self.tx, &upper_key)?
+        else {
             return Ok(None);
         };
 
-        let name = decode_utf8(key)?;
-        let (id, metadata) = decode_collection_catalog_value(value)?;
-        Ok(Some(CollectionCatalogEntry { id, name, metadata }))
+        let (stored_collection_id, stored_version) = decode_collection_catalog_key(stored_key)?;
+        if stored_collection_id != collection_id || stored_version > self.ts {
+            return Ok(None);
+        }
+
+        decode_collection_catalog_value(value).map(Some)
+    }
+}
+
+impl DatastoreCursor for HeedCollectionCatalogCursor<'_, '_> {
+    type Item = CollectionCatalogEntry;
+
+    fn next(&mut self) -> crate::error::Result<Option<Self::Item>> {
+        loop {
+            let Some((key, value)) = self.raw.next_raw()? else {
+                return Ok(None);
+            };
+
+            let index_name = decode_utf8(key)?;
+            let id = decode_i64(value)?;
+            let Some((catalog_name, metadata)) = self.visible_collection(id)? else {
+                continue;
+            };
+            if catalog_name != index_name {
+                return Err(Error::implementation(format!(
+                    "collection name index points to id {id}, but catalog row has name {catalog_name}"
+                )));
+            }
+
+            return Ok(Some(CollectionCatalogEntry {
+                id,
+                name: catalog_name,
+                metadata,
+            }));
+        }
     }
 }
 
