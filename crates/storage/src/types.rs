@@ -7,7 +7,7 @@ pub type DocumentId = u128;
 /// Collection id, negative numbers are temporary indicators used in write sets for new collections
 pub type CollectionId = i64;
 
-/// Auto incrementing id
+/// Index id, negative numbers are temporary indicators used in write sets for new indexes
 pub type IndexId = i64;
 
 // Arbitrary binary data
