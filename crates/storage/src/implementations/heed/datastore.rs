@@ -1,54 +1,49 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::{collections::HashMap, fs, io, sync::Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{collections::HashMap, fs, sync::Arc};
 
-use heed3::Database;
-use heed3::Env;
-use heed3::EnvFlags;
-use heed3::EnvOpenOptions;
-use heed3::RwTxn;
-use heed3::types::{Bytes, Str};
+use heed3::types::Bytes;
+use heed3::{Database, DatabaseFlags, Env, EnvFlags, EnvOpenOptions, RwTxn, WithoutTls};
 
 use crate::implementations::heed::encoding::{
-    decode_u64, encode_document_key, encode_vacuum_target_key,
+    DOCUMENT_TOMBSTONE, ROOT_INDEX_CHAIN_ID, decode_collection_catalog_value,
+    decode_index_catalog_value, decode_u64, decode_utf8, encode_collection_catalog_value,
+    encode_document_key, encode_document_value, encode_index_catalog_key,
+    encode_index_catalog_value, encode_index_document_id, encode_index_node_key,
+    encode_vacuum_target_key, index_node_prefix, split_index_key,
 };
 use crate::{
+    error::Error,
     implementations::heed::transaction::HeedDatastoreTransaction,
     traits::Datastore,
-    types::{CollectionId, DocumentId, IndexId},
+    types::{CollectionId, DocumentId, IndexId, Value},
+    write_set::CollectionWriteSet,
 };
 
 const METADATA_TS_KEY: &[u8] = &[0x00];
 const METADATA_INDEX_CHAIN_ID_KEY: &[u8] = &[0x01];
 const METADATA_COLLECTION_ID_KEY: &[u8] = &[0x02];
 const METADATA_INDEX_ID_KEY: &[u8] = &[0x03];
-const DOCUMENT_TOMBSTONE: &[u8] = &[0x00];
-const DOCUMENT_VALUE_PREFIX: u8 = 0x01;
-const MAX_INDEX_SEGMENT_SIZE: usize = 478;
-const INDEX_SEGMENT_MIDDLE: u8 = 0x00;
-const INDEX_SEGMENT_LAST: u8 = 0x01;
-const INDEX_SEGMENT_FIRST: u8 = 0x02;
-const INDEX_SEGMENT_SHORT: u8 = 0x03;
 
 #[derive(Clone)]
 pub struct HeedStorageEngine {
     /// Heed environment
-    pub(super) env: Arc<Env>,
+    pub(super) env: Arc<Env<WithoutTls>>,
     /// Catalog of index names to index ids + config
     pub(super) indexes_catalog: Database<Bytes, Bytes>,
     /// Catalog of collection names to collection ids + metadata
     pub(super) collections_catalog: Database<Bytes, Bytes>,
-    /// Each index entry for all docs
-    pub(super) index_entries: Database<Bytes, Bytes>,
-    /// Documents themselves
+    /// Index trie edges: `[index id][parent chain id][segment] -> [child chain id]`.
+    pub(super) index_edges: Database<Bytes, Bytes>,
+    /// Index trie leaves: `[index id][parent chain id][segment] -> duplicate sorted document ids`.
+    pub(super) index_leaves: Database<Bytes, Bytes>,
+    /// Timestamped document versions.
     pub(super) documents: Database<Bytes, Bytes>,
-    /// Metadata database (e.g. for global timestamp counter)
+    /// Metadata database (e.g. global timestamp and id counters).
     pub(super) metadata: Database<Bytes, Bytes>,
-    /// Vacuum targets (documents with previous versions to be vacuumed and related index entries)
+    /// Documents with previous versions to be considered by vacuum.
     pub(super) vacuum_targets: Database<Bytes, Bytes>,
 
-    // counters
     pub(super) ts: Arc<AtomicU64>,
-    pub(crate) ts_changed: Arc<AtomicBool>,
     pub(super) collection_id_counter: Arc<AtomicU64>,
     pub(super) collection_id_counter_changed: Arc<AtomicBool>,
     pub(super) index_id_counter: Arc<AtomicU64>,
@@ -64,12 +59,12 @@ impl HeedStorageEngine {
     pub fn open(path: &str) -> crate::error::Result<Self> {
         fs::create_dir_all(path)?;
 
-        let mut options = EnvOpenOptions::new();
+        let mut options = EnvOpenOptions::new().read_txn_without_tls();
         options
             .map_size(Self::DEFAULT_MAP_SIZE)
             .max_dbs(Self::DEFAULT_MAX_DBS);
 
-        // Favor cheap commits; callers should use `flush`/`force_sync` for durability checkpoints.
+        // Favor cheap commits; callers should use `flush` for durability checkpoints.
         unsafe {
             options.flags(
                 EnvFlags::NO_SYNC
@@ -80,184 +75,198 @@ impl HeedStorageEngine {
         }
 
         let env = unsafe { options.open(path)? };
-
         Self::new(Arc::new(env))
     }
 
-    pub fn new(env: Arc<Env>) -> crate::error::Result<Self> {
+    pub fn new(env: Arc<Env<WithoutTls>>) -> crate::error::Result<Self> {
         let mut wtxn = env.write_txn()?;
 
         let indexes_catalog = env.create_database(&mut wtxn, Some("indexes_catalog"))?;
         let collections_catalog = env.create_database(&mut wtxn, Some("collections_catalog"))?;
-        let index_entries = env.create_database(&mut wtxn, Some("index_entries"))?;
+        let index_edges = env.create_database(&mut wtxn, Some("index_edges"))?;
+        let index_leaves = env
+            .database_options()
+            .types::<Bytes, Bytes>()
+            .flags(DatabaseFlags::DUP_SORT)
+            .name("index_leaves")
+            .create(&mut wtxn)?;
         let documents = env.create_database(&mut wtxn, Some("documents"))?;
         let metadata = env.create_database(&mut wtxn, Some("metadata"))?;
         let vacuum_targets = env.create_database(&mut wtxn, Some("vacuum_targets"))?;
-        // load counters
 
-        wtxn.commit()?;
-
-        Ok(Self {
-            env,
+        let engine = Self {
+            env: Arc::clone(&env),
             indexes_catalog,
             collections_catalog,
-            index_entries,
+            index_edges,
+            index_leaves,
             documents,
             metadata,
             vacuum_targets,
             ts: Arc::new(AtomicU64::new(0)),
-            ts_changed: Arc::new(AtomicBool::new(false)),
             collection_id_counter: Arc::new(AtomicU64::new(0)),
             collection_id_counter_changed: Arc::new(AtomicBool::new(false)),
             index_id_counter: Arc::new(AtomicU64::new(0)),
             index_id_counter_changed: Arc::new(AtomicBool::new(false)),
             index_chain_id_counter: Arc::new(AtomicU64::new(0)),
             index_chain_id_counter_changed: Arc::new(AtomicBool::new(false)),
-        })
+        };
+
+        engine.load_counters(&wtxn)?;
+        wtxn.commit()?;
+
+        Ok(engine)
     }
 
-    fn load_counters(&mut self, tx: &RwTxn) -> crate::error::Result<()> {
-        let ts = self
-            .metadata
-            .get(tx, METADATA_TS_KEY)?
-            .map(decode_u64)
-            .transpose()?
-            .unwrap_or(0);
-        self.ts.store(ts, std::sync::atomic::Ordering::SeqCst);
+    fn load_counters(&self, tx: &RwTxn) -> crate::error::Result<()> {
+        self.ts.store(
+            self.metadata
+                .get(tx, METADATA_TS_KEY)?
+                .map(decode_u64)
+                .transpose()?
+                .unwrap_or(0),
+            Ordering::SeqCst,
+        );
 
-        let collection_id_counter = self
-            .metadata
-            .get(tx, METADATA_COLLECTION_ID_KEY)?
-            .map(decode_u64)
-            .transpose()?
-            .unwrap_or(0);
-        self.collection_id_counter
-            .store(collection_id_counter, std::sync::atomic::Ordering::SeqCst);
+        self.collection_id_counter.store(
+            self.metadata
+                .get(tx, METADATA_COLLECTION_ID_KEY)?
+                .map(decode_u64)
+                .transpose()?
+                .unwrap_or(0),
+            Ordering::SeqCst,
+        );
 
-        let index_id_counter = self
-            .metadata
-            .get(tx, METADATA_INDEX_ID_KEY)?
-            .map(decode_u64)
-            .transpose()?
-            .unwrap_or(0);
-        self.index_id_counter
-            .store(index_id_counter, std::sync::atomic::Ordering::SeqCst);
+        self.index_id_counter.store(
+            self.metadata
+                .get(tx, METADATA_INDEX_ID_KEY)?
+                .map(decode_u64)
+                .transpose()?
+                .unwrap_or(0),
+            Ordering::SeqCst,
+        );
 
-        let index_chain_id_counter = self
-            .metadata
-            .get(tx, METADATA_INDEX_CHAIN_ID_KEY)?
-            .map(decode_u64)
-            .transpose()?
-            .unwrap_or(0);
-        self.index_chain_id_counter
-            .store(index_chain_id_counter, std::sync::atomic::Ordering::SeqCst);
+        self.index_chain_id_counter.store(
+            self.metadata
+                .get(tx, METADATA_INDEX_CHAIN_ID_KEY)?
+                .map(decode_u64)
+                .transpose()?
+                .unwrap_or(0),
+            Ordering::SeqCst,
+        );
 
-        self.ts_changed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.collection_id_counter_changed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.index_id_counter_changed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+            .store(false, Ordering::SeqCst);
+        self.index_id_counter_changed.store(false, Ordering::SeqCst);
         self.index_chain_id_counter_changed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+            .store(false, Ordering::SeqCst);
 
         Ok(())
     }
 
-    fn save_counters(&mut self, tx: &mut RwTxn) -> crate::error::Result<()> {
-        if self.ts_changed.load(std::sync::atomic::Ordering::SeqCst) {
-            let ts = self.ts.load(std::sync::atomic::Ordering::SeqCst);
-            self.metadata.put(tx, METADATA_TS_KEY, &ts.to_le_bytes())?;
-            self.ts_changed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
+    fn save_counters(&self, tx: &mut RwTxn) -> crate::error::Result<()> {
         if self
             .collection_id_counter_changed
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .swap(false, Ordering::SeqCst)
         {
-            let collection_id_counter = self
-                .collection_id_counter
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let collection_id_counter = self.collection_id_counter.load(Ordering::SeqCst);
             self.metadata.put(
                 tx,
                 METADATA_COLLECTION_ID_KEY,
                 &collection_id_counter.to_be_bytes(),
             )?;
-            self.collection_id_counter_changed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
-        if self
-            .index_id_counter_changed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let index_id_counter = self
-                .index_id_counter
-                .load(std::sync::atomic::Ordering::SeqCst);
+        if self.index_id_counter_changed.swap(false, Ordering::SeqCst) {
+            let index_id_counter = self.index_id_counter.load(Ordering::SeqCst);
             self.metadata
                 .put(tx, METADATA_INDEX_ID_KEY, &index_id_counter.to_be_bytes())?;
-            self.index_id_counter_changed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
         if self
             .index_chain_id_counter_changed
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .swap(false, Ordering::SeqCst)
         {
-            let index_chain_id_counter = self
-                .index_chain_id_counter
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let index_chain_id_counter = self.index_chain_id_counter.load(Ordering::SeqCst);
             self.metadata.put(
                 tx,
                 METADATA_INDEX_CHAIN_ID_KEY,
                 &index_chain_id_counter.to_be_bytes(),
             )?;
-            self.index_chain_id_counter_changed
-                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(())
     }
 
-    fn allocate_collection_id(&self, tx: &mut RwTxn) -> crate::error::Result<CollectionId> {
-        let id = self
-            .collection_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+    fn allocate_collection_id(&self) -> CollectionId {
+        let id = self.collection_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
         self.collection_id_counter_changed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(id as CollectionId)
+            .store(true, Ordering::SeqCst);
+        id as CollectionId
     }
 
-    fn allocate_index_id(&self, tx: &mut RwTxn) -> crate::error::Result<IndexId> {
-        let id = self
-            .index_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        self.index_id_counter_changed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(id as IndexId)
+    fn allocate_index_id(&self) -> IndexId {
+        let id = self.index_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        self.index_id_counter_changed.store(true, Ordering::SeqCst);
+        id as IndexId
     }
 
-    fn allocate_chain_id(&self, tx: &mut RwTxn) -> crate::error::Result<u64> {
-        let id = self
-            .index_chain_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+    fn allocate_chain_id(&self) -> u64 {
+        let id = self.index_chain_id_counter.fetch_add(1, Ordering::SeqCst) + 1;
         self.index_chain_id_counter_changed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(id)
+            .store(true, Ordering::SeqCst);
+        id
     }
 
-    /// Creates new collection or returns existing collection id if collection with the same name already exists
+    fn set_ts(&self, tx: &mut RwTxn, ts: u64) -> crate::error::Result<()> {
+        loop {
+            let current = self.ts.load(Ordering::SeqCst);
+            if ts < current {
+                return Err(Error::implementation(format!(
+                    "timestamp {ts} is lower than current timestamp {current}"
+                )));
+            }
+
+            if ts == current {
+                return Ok(());
+            }
+
+            if self
+                .ts
+                .compare_exchange(current, ts, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.metadata.put(tx, METADATA_TS_KEY, &ts.to_be_bytes())?;
+                return Ok(());
+            }
+        }
+    }
+
+    /// Creates a new collection or returns the existing collection id for the same name.
     fn create_collection(
         &self,
         tx: &mut RwTxn,
         collection_name: &str,
         metadata: Option<&[u8]>,
     ) -> crate::error::Result<CollectionId> {
-        todo!()
+        if let Some(value) = self
+            .collections_catalog
+            .get(tx, collection_name.as_bytes())?
+        {
+            let (id, _) = decode_collection_catalog_value(value)?;
+            if let Some(metadata) = metadata {
+                let value = encode_collection_catalog_value(id, metadata);
+                self.collections_catalog
+                    .put(tx, collection_name.as_bytes(), &value)?;
+            }
+            return Ok(id);
+        }
+
+        let id = self.allocate_collection_id();
+        let value = encode_collection_catalog_value(id, metadata.unwrap_or_default());
+        self.collections_catalog
+            .put(tx, collection_name.as_bytes(), &value)?;
+        Ok(id)
     }
 
     fn create_index(
@@ -267,7 +276,145 @@ impl HeedStorageEngine {
         index_name: &str,
         index_config: &[u8],
     ) -> crate::error::Result<IndexId> {
-        todo!()
+        let key = encode_index_catalog_key(collection_id, index_name);
+        if let Some(value) = self.indexes_catalog.get(tx, &key)? {
+            let (id, _) = decode_index_catalog_value(value)?;
+            return Ok(id);
+        }
+
+        let id = self.allocate_index_id();
+        let value = encode_index_catalog_value(id, index_config);
+        self.indexes_catalog.put(tx, &key, &value)?;
+        Ok(id)
+    }
+
+    fn update_collection_metadata(
+        &self,
+        tx: &mut RwTxn,
+        collection_id: CollectionId,
+        metadata: &[u8],
+    ) -> crate::error::Result<()> {
+        let name = self
+            .collection_name_by_id(tx, collection_id)?
+            .ok_or_else(|| {
+                Error::implementation(format!("collection id {collection_id} does not exist"))
+            })?;
+        let value = encode_collection_catalog_value(collection_id, metadata);
+        self.collections_catalog.put(tx, name.as_bytes(), &value)?;
+        Ok(())
+    }
+
+    fn collection_name_by_id(
+        &self,
+        tx: &RwTxn,
+        collection_id: CollectionId,
+    ) -> crate::error::Result<Option<String>> {
+        for row in self.collections_catalog.iter(tx)? {
+            let (key, value) = row?;
+            let (id, _) = decode_collection_catalog_value(value)?;
+            if id == collection_id {
+                return Ok(Some(decode_utf8(key)?));
+            }
+        }
+        Ok(None)
+    }
+
+    fn put_index_entry(
+        &self,
+        tx: &mut RwTxn,
+        index_id: IndexId,
+        index_key: &[u8],
+        document_id: DocumentId,
+    ) -> crate::error::Result<()> {
+        let segments = split_index_key(index_key);
+        let mut chain_id = ROOT_INDEX_CHAIN_ID;
+
+        for segment in &segments[..segments.len() - 1] {
+            chain_id = self.find_or_create_index_edge(tx, index_id, chain_id, segment)?;
+        }
+
+        let last_segment = segments[segments.len() - 1];
+        let key = encode_index_node_key(index_id, chain_id, last_segment);
+        let document_id = encode_index_document_id(document_id);
+        self.index_leaves
+            .delete_one_duplicate(tx, &key, &document_id)?;
+        self.index_leaves.put(tx, &key, &document_id)?;
+        Ok(())
+    }
+
+    fn delete_index_entry(
+        &self,
+        tx: &mut RwTxn,
+        index_id: IndexId,
+        index_key: &[u8],
+        document_id: DocumentId,
+    ) -> crate::error::Result<()> {
+        let segments = split_index_key(index_key);
+        let mut chain_id = ROOT_INDEX_CHAIN_ID;
+        let mut path = Vec::with_capacity(segments.len().saturating_sub(1));
+
+        for segment in &segments[..segments.len() - 1] {
+            let key = encode_index_node_key(index_id, chain_id, segment);
+            let Some(value) = self.index_edges.get(tx, &key)? else {
+                return Ok(());
+            };
+            let child_chain_id = decode_u64(value)?;
+            path.push(IndexPathEdge {
+                parent_chain_id: chain_id,
+                segment: (*segment).to_vec(),
+                child_chain_id,
+            });
+            chain_id = child_chain_id;
+        }
+
+        let last_segment = segments[segments.len() - 1];
+        let key = encode_index_node_key(index_id, chain_id, last_segment);
+        let document_id = encode_index_document_id(document_id);
+        self.index_leaves
+            .delete_one_duplicate(tx, &key, &document_id)?;
+
+        for edge in path.into_iter().rev() {
+            if self.index_node_has_entries(tx, index_id, edge.child_chain_id)? {
+                break;
+            }
+
+            let key = encode_index_node_key(index_id, edge.parent_chain_id, &edge.segment);
+            self.index_edges.delete(tx, &key)?;
+        }
+
+        Ok(())
+    }
+
+    fn find_or_create_index_edge(
+        &self,
+        tx: &mut RwTxn,
+        index_id: IndexId,
+        parent_chain_id: u64,
+        segment: &[u8],
+    ) -> crate::error::Result<u64> {
+        let key = encode_index_node_key(index_id, parent_chain_id, segment);
+        if let Some(value) = self.index_edges.get(tx, &key)? {
+            return decode_u64(value);
+        }
+
+        let child_chain_id = self.allocate_chain_id();
+        self.index_edges
+            .put(tx, &key, &child_chain_id.to_be_bytes())?;
+        Ok(child_chain_id)
+    }
+
+    fn index_node_has_entries(
+        &self,
+        tx: &RwTxn,
+        index_id: IndexId,
+        chain_id: u64,
+    ) -> crate::error::Result<bool> {
+        let prefix = index_node_prefix(index_id, chain_id);
+        if self.index_leaves.prefix_iter(tx, &prefix)?.next().is_some() {
+            return Ok(true);
+        }
+
+        Ok(self.index_edges.prefix_iter(tx, &prefix)?.next().is_some())
     }
 }
 
@@ -277,13 +424,11 @@ impl Datastore for HeedStorageEngine {
         ts: u64,
     ) -> crate::error::Result<impl crate::traits::DatastoreTransaction + '_> {
         let tx = self.env.read_txn()?;
-
         Ok(HeedDatastoreTransaction::new(self, tx, ts))
     }
 
     fn put(&self, batch: crate::write_set::WriteSet) -> crate::error::Result<()> {
         let mut wtxn = self.env.write_txn()?;
-
         let mut new_collections = HashMap::<CollectionId, CollectionId>::new();
 
         for (new_collection_tmp_id, new_collection_name) in batch.new_collections {
@@ -295,65 +440,53 @@ impl Datastore for HeedStorageEngine {
         let mut new_indexes = HashMap::<IndexId, IndexId>::new();
 
         for (collection_id, new_index_tmp_id, name, data) in batch.new_indexes {
-            let collection_id: CollectionId = if collection_id < 0 {
-                new_collections
-                    .get(&(collection_id as CollectionId))
-                    .copied()
-                    .ok_or_else(|| {
-                        crate::error::Error::implementation(format!(
-                            "invalid collection id {} for new index in batch",
-                            collection_id
-                        ))
-                    })?
-            } else {
-                collection_id as CollectionId
-            };
-
+            let collection_id = resolve_collection_id(collection_id, &new_collections)?;
             let new_index_id = self.create_index(&mut wtxn, collection_id, &name, &data)?;
             new_indexes.insert(new_index_tmp_id, new_index_id);
         }
 
         for (collection_id, data) in batch.collections {
-            let collection_id: CollectionId = if collection_id < 0 {
-                new_collections
-                    .get(&(collection_id as CollectionId))
-                    .copied()
-                    .ok_or_else(|| {
-                        crate::error::Error::implementation(format!(
-                            "invalid collection id {} in batch",
-                            collection_id
-                        ))
-                    })?
-            } else {
-                collection_id as CollectionId
-            };
+            let collection_id = resolve_collection_id(collection_id, &new_collections)?;
+            let CollectionWriteSet {
+                documents,
+                deleted_keys,
+                index_entries,
+                deleted_index_entries,
+                metadata,
+            } = data;
 
-            for (document_id, data) in data.documents {
+            for (document_id, data) in documents {
                 let key = encode_document_key(collection_id, document_id, batch.ts);
-                let value = [vec![DOCUMENT_VALUE_PREFIX], data].concat();
+                let value = encode_document_value(&data);
                 self.documents.put(&mut wtxn, &key, &value)?;
                 let vacuum_key = encode_vacuum_target_key(collection_id, document_id);
                 self.vacuum_targets.put(&mut wtxn, &vacuum_key, &[])?;
             }
 
-            for document_id in data.deleted_keys {
+            for document_id in deleted_keys {
                 let key = encode_document_key(collection_id, document_id, batch.ts);
                 self.documents.put(&mut wtxn, &key, DOCUMENT_TOMBSTONE)?;
                 let vacuum_key = encode_vacuum_target_key(collection_id, document_id);
                 self.vacuum_targets.put(&mut wtxn, &vacuum_key, &[])?;
             }
 
-            for (index_id, index_key, document_id) in data.index_entries {
-                todo!("put index entry following README's logic")
+            for (index_id, index_key, document_id) in index_entries {
+                let index_id = resolve_index_id(index_id, &new_indexes)?;
+                self.put_index_entry(&mut wtxn, index_id, &index_key, document_id)?;
             }
 
-            for (index_id, index_key, document_id) in data.deleted_index_entries {
-                todo!("delete index entry following README's logic")
+            for (index_id, index_key, document_id) in deleted_index_entries {
+                let index_id = resolve_index_id(index_id, &new_indexes)?;
+                self.delete_index_entry(&mut wtxn, index_id, &index_key, document_id)?;
             }
 
-            // update meta in collections catalog
+            if let Some(metadata) = metadata {
+                self.update_collection_metadata(&mut wtxn, collection_id, &metadata)?;
+            }
         }
 
+        self.set_ts(&mut wtxn, batch.ts)?;
+        self.save_counters(&mut wtxn)?;
         wtxn.commit()?;
 
         Ok(())
@@ -364,13 +497,46 @@ impl Datastore for HeedStorageEngine {
     }
 
     fn set_ts(&self, ts: u64) -> crate::error::Result<()> {
-        self.ts.store(ts, std::sync::atomic::Ordering::SeqCst);
-        self.ts_changed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut wtxn = self.env.write_txn()?;
+        self.set_ts(&mut wtxn, ts)?;
+        wtxn.commit()?;
         Ok(())
     }
 
     fn get_ts(&self) -> crate::error::Result<u64> {
-        Ok(self.ts.load(std::sync::atomic::Ordering::SeqCst))
+        Ok(self.ts.load(Ordering::SeqCst))
     }
+}
+
+struct IndexPathEdge {
+    parent_chain_id: u64,
+    segment: Value,
+    child_chain_id: u64,
+}
+
+fn resolve_collection_id(
+    collection_id: CollectionId,
+    new_collections: &HashMap<CollectionId, CollectionId>,
+) -> crate::error::Result<CollectionId> {
+    if collection_id >= 0 {
+        return Ok(collection_id);
+    }
+
+    new_collections.get(&collection_id).copied().ok_or_else(|| {
+        Error::implementation(format!("invalid collection id {collection_id} in batch"))
+    })
+}
+
+fn resolve_index_id(
+    index_id: IndexId,
+    new_indexes: &HashMap<IndexId, IndexId>,
+) -> crate::error::Result<IndexId> {
+    if index_id >= 0 {
+        return Ok(index_id);
+    }
+
+    new_indexes
+        .get(&index_id)
+        .copied()
+        .ok_or_else(|| Error::implementation(format!("invalid index id {index_id} in batch")))
 }

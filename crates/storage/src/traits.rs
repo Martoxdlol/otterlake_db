@@ -1,17 +1,17 @@
 use crate::{
     error::Result,
-    types::{CollectionId, Direction, DocumentId, Value},
+    types::{
+        CollectionCatalogEntry, CollectionId, CursorStart, Direction, DocumentEntry, DocumentId,
+        IndexCatalogEntry, IndexEntry, IndexId, IndexPosition, Value,
+    },
     write_set::WriteSet,
 };
 
 pub trait DatastoreCursor {
-    /// Returns next document id + document value
-    fn next(&mut self) -> Option<(DocumentId, Value)>;
-}
+    type Item;
 
-pub trait DatastoreIndexCursor {
-    /// Returns next index entry value + document id
-    fn next(&mut self) -> Option<(Value, DocumentId)>;
+    /// Returns the next item in cursor order.
+    fn next(&mut self) -> Result<Option<Self::Item>>;
 }
 
 pub trait DatastoreTransaction {
@@ -24,31 +24,30 @@ pub trait DatastoreTransaction {
     fn get_cursor(
         &self,
         collection: CollectionId,
-        key: DocumentId,
+        start: CursorStart<DocumentId>,
         direction: Direction,
-        exclude_start: bool,
-    ) -> Result<impl DatastoreCursor>;
+    ) -> Result<impl DatastoreCursor<Item = DocumentEntry>>;
 
     fn get_index_cursor(
         &self,
-        index: CollectionId,
-        key: DocumentId,
+        collection: CollectionId,
+        index: IndexId,
+        start: CursorStart<IndexPosition>,
         direction: Direction,
-        exclude_start: bool,
-    ) -> Result<impl DatastoreIndexCursor>;
+    ) -> Result<impl DatastoreCursor<Item = IndexEntry>>;
 
     fn get_collections_catalog_cursor(
         &self,
-        name: &str,
+        start: CursorStart<String>,
         direction: Direction,
-    ) -> Result<impl DatastoreCursor>;
+    ) -> Result<impl DatastoreCursor<Item = CollectionCatalogEntry>>;
 
     fn get_indexes_catalog_cursor(
         &self,
         collection: CollectionId,
-        name: &str,
+        start: CursorStart<String>,
         direction: Direction,
-    ) -> Result<impl DatastoreCursor>;
+    ) -> Result<impl DatastoreCursor<Item = IndexCatalogEntry>>;
 }
 
 pub trait Datastore: Clone + Send + Sync {
@@ -61,7 +60,7 @@ pub trait Datastore: Clone + Send + Sync {
     /// Flushes all pending changes to disk
     fn flush(&self) -> Result<()>;
 
-    /// Set global timestamp counter
+    /// Set global timestamp counter. Implementations must reject values lower than the current one.
     fn set_ts(&self, ts: u64) -> Result<()>;
 
     /// Get global timestamp counter
