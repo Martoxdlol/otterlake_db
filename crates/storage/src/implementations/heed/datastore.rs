@@ -17,7 +17,7 @@ use crate::{
     implementations::heed::transaction::HeedDatastoreTransaction,
     traits::Datastore,
     types::{CollectionId, DocumentId, IndexId, Value},
-    write_set::CollectionWriteSet,
+    write_set::{CollectionWriteSet, DocumentWrite, IndexWrite},
 };
 
 const METADATA_TS_KEY: &[u8] = &[0x00];
@@ -491,45 +491,56 @@ impl Datastore for HeedStorageEngine {
 
         let mut new_indexes = HashMap::<IndexId, IndexId>::new();
 
-        for (collection_id, new_index_tmp_id, name, data) in batch.new_indexes {
+        for (collection_id, indexes) in batch.new_indexes {
             let collection_id = resolve_collection_id(collection_id, &new_collections)?;
-            let new_index_id = self.create_index(&mut wtxn, collection_id, &name, &data)?;
-            new_indexes.insert(new_index_tmp_id, new_index_id);
+            for (new_index_tmp_id, index) in indexes {
+                let new_index_id =
+                    self.create_index(&mut wtxn, collection_id, &index.name, &index.metadata)?;
+                new_indexes.insert(new_index_tmp_id, new_index_id);
+            }
         }
 
         for (collection_id, data) in batch.collections {
             let collection_id = resolve_collection_id(collection_id, &new_collections)?;
             let CollectionWriteSet {
                 documents,
-                deleted_keys,
                 index_entries,
-                deleted_index_entries,
                 metadata,
             } = data;
 
-            for (document_id, data) in documents {
+            for (document_id, write) in documents {
                 let key = encode_document_key(collection_id, document_id, batch.ts);
-                let value = encode_document_value(&data);
-                self.documents.put(&mut wtxn, &key, &value)?;
+                match write {
+                    DocumentWrite::Put(data) => {
+                        let value = encode_document_value(&data);
+                        self.documents.put(&mut wtxn, &key, &value)?;
+                    }
+                    DocumentWrite::Deleted => {
+                        self.documents.put(&mut wtxn, &key, DOCUMENT_TOMBSTONE)?;
+                    }
+                }
                 let vacuum_key = encode_vacuum_target_key(collection_id, document_id);
                 self.vacuum_targets.put(&mut wtxn, &vacuum_key, &[])?;
             }
 
-            for document_id in deleted_keys {
-                let key = encode_document_key(collection_id, document_id, batch.ts);
-                self.documents.put(&mut wtxn, &key, DOCUMENT_TOMBSTONE)?;
-                let vacuum_key = encode_vacuum_target_key(collection_id, document_id);
-                self.vacuum_targets.put(&mut wtxn, &vacuum_key, &[])?;
-            }
-
-            for (index_id, index_key, document_id) in index_entries {
+            for (index_id, entries) in index_entries {
                 let index_id = resolve_index_id(index_id, &new_indexes)?;
-                self.put_index_entry(&mut wtxn, index_id, &index_key, document_id)?;
-            }
-
-            for (index_id, index_key, document_id) in deleted_index_entries {
-                let index_id = resolve_index_id(index_id, &new_indexes)?;
-                self.delete_index_entry(&mut wtxn, index_id, &index_key, document_id)?;
+                for (position, write) in entries {
+                    match write {
+                        IndexWrite::Put => self.put_index_entry(
+                            &mut wtxn,
+                            index_id,
+                            &position.value,
+                            position.document_id,
+                        )?,
+                        IndexWrite::Deleted => self.delete_index_entry(
+                            &mut wtxn,
+                            index_id,
+                            &position.value,
+                            position.document_id,
+                        )?,
+                    }
+                }
             }
 
             if let Some(metadata) = metadata {

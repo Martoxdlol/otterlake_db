@@ -1,13 +1,11 @@
-use std::collections::HashMap;
-
 use storage::{
     implementations::heed::datastore::HeedStorageEngine,
     traits::{Datastore, DatastoreCursor, DatastoreTransaction},
     types::{
-        CollectionCatalogEntry, CollectionId, CursorStart, Direction, IndexEntry, IndexId,
-        IndexPosition,
+        CollectionCatalogEntry, CollectionId, CursorStart, Direction, DocumentEntry, IndexEntry,
+        IndexId, IndexPosition,
     },
-    write_set::{CollectionWriteSet, WriteSet},
+    write_set::WriteSet,
 };
 use tempfile::TempDir;
 
@@ -18,15 +16,18 @@ fn open_engine() -> (TempDir, HeedStorageEngine) {
     (dir, engine)
 }
 
+fn write_set(ts: u64) -> WriteSet {
+    WriteSet {
+        ts,
+        ..WriteSet::default()
+    }
+}
+
 fn create_collection_and_index(engine: &HeedStorageEngine) -> (CollectionId, IndexId) {
-    engine
-        .put(WriteSet {
-            collections: HashMap::new(),
-            new_collections: vec![(-1, "docs".to_owned())],
-            new_indexes: vec![(-1, -1, "by_value".to_owned(), Vec::new())],
-            ts: 1,
-        })
-        .expect("create catalog entries");
+    let mut batch = write_set(1);
+    batch.new_collection(-1, "docs".to_owned());
+    batch.new_index(-1, -1, "by_value".to_owned(), Vec::new());
+    engine.put(batch).expect("create catalog entries");
 
     let tx = engine.transaction(1).expect("read transaction");
     let collection = tx
@@ -68,26 +69,9 @@ fn delete_documents(
     collection: CollectionId,
     deleted_keys: Vec<u128>,
 ) {
-    let mut collections = HashMap::new();
-    collections.insert(
-        collection,
-        CollectionWriteSet {
-            documents: Vec::new(),
-            deleted_keys,
-            index_entries: Vec::new(),
-            deleted_index_entries: Vec::new(),
-            metadata: None,
-        },
-    );
-
-    engine
-        .put(WriteSet {
-            collections,
-            new_collections: Vec::new(),
-            new_indexes: Vec::new(),
-            ts,
-        })
-        .expect("delete documents");
+    let mut batch = write_set(ts);
+    batch.delete_many(collection, deleted_keys);
+    engine.put(batch).expect("delete documents");
 }
 
 fn put_index_changes(
@@ -97,33 +81,25 @@ fn put_index_changes(
     entries: Vec<(IndexId, Vec<u8>, u128)>,
     deleted_entries: Vec<(IndexId, Vec<u8>, u128)>,
 ) {
-    let documents = entries
-        .iter()
-        .map(|(_, _, document_id)| (*document_id, document_value(*document_id)))
-        .collect();
-    let mut collections = HashMap::new();
-    collections.insert(
-        collection,
-        CollectionWriteSet {
-            documents,
-            deleted_keys: Vec::new(),
-            index_entries: entries,
-            deleted_index_entries: deleted_entries,
-            metadata: None,
-        },
-    );
-
-    engine
-        .put(WriteSet {
-            collections,
-            new_collections: Vec::new(),
-            new_indexes: Vec::new(),
-            ts,
-        })
-        .expect("write index changes");
+    let mut batch = write_set(ts);
+    for (_, _, document_id) in &entries {
+        batch.put(collection, *document_id, document_value(*document_id));
+    }
+    batch.put_index_entries(collection, entries);
+    batch.delete_index_entries(collection, deleted_entries);
+    engine.put(batch).expect("write index changes");
 }
 
 fn collect_index(cursor: impl DatastoreCursor<Item = IndexEntry>) -> Vec<IndexEntry> {
+    let mut cursor = cursor;
+    let mut entries = Vec::new();
+    while let Some(entry) = cursor.next().expect("cursor next") {
+        entries.push(entry);
+    }
+    entries
+}
+
+fn collect_documents(cursor: impl DatastoreCursor<Item = DocumentEntry>) -> Vec<DocumentEntry> {
     let mut cursor = cursor;
     let mut entries = Vec::new();
     while let Some(entry) = cursor.next().expect("cursor next") {
@@ -170,6 +146,13 @@ fn entry(value: &[u8], document_id: u128) -> IndexEntry {
     }
 }
 
+fn document_entry(id: u128, value: &[u8]) -> DocumentEntry {
+    DocumentEntry {
+        id,
+        value: value.to_vec(),
+    }
+}
+
 fn collection_entry(id: CollectionId, name: &str, metadata: &[u8]) -> CollectionCatalogEntry {
     CollectionCatalogEntry {
         id,
@@ -179,17 +162,262 @@ fn collection_entry(id: CollectionId, name: &str, metadata: &[u8]) -> Collection
 }
 
 #[test]
+fn transaction_recorded_document_writes_are_read_interactively() {
+    let (_dir, engine) = open_engine();
+    let (collection, _) = create_collection_and_index(&engine);
+
+    let mut tx = engine.transaction(1).expect("read transaction");
+    assert_eq!(tx.get(collection, 10).expect("get missing"), None);
+
+    tx.put(collection, 10, b"first".to_vec())
+        .expect("record document put");
+    assert_eq!(
+        tx.get(collection, 10).expect("get first"),
+        Some(b"first".to_vec())
+    );
+
+    tx.put(collection, 10, b"second".to_vec())
+        .expect("record document overwrite");
+    assert_eq!(
+        tx.get(collection, 10).expect("get second"),
+        Some(b"second".to_vec())
+    );
+
+    tx.delete(collection, 10).expect("record document delete");
+    assert_eq!(tx.get(collection, 10).expect("get deleted"), None);
+
+    tx.put(collection, 10, b"third".to_vec())
+        .expect("record document after delete");
+    assert_eq!(
+        tx.get(collection, 10).expect("get third"),
+        Some(b"third".to_vec())
+    );
+}
+
+#[test]
+fn transaction_recorded_writes_can_be_persisted_as_write_set() {
+    let (_dir, engine) = open_engine();
+    let (collection, index) = create_collection_and_index(&engine);
+
+    let mut tx = engine.transaction(1).expect("read transaction");
+    tx.put(collection, 10, b"persisted".to_vec())
+        .expect("record document put");
+    tx.put_index_entry(collection, index, b"a".to_vec(), 10)
+        .expect("record index put");
+
+    let batch = tx.into_write_set(2);
+    engine.put(batch).expect("persist recorded writes");
+
+    let tx = engine.transaction(2).expect("read transaction");
+    assert_eq!(
+        tx.get(collection, 10).expect("get persisted"),
+        Some(b"persisted".to_vec())
+    );
+    let cursor = tx
+        .get_index_cursor(
+            collection,
+            index,
+            CursorStart::Unbounded,
+            Direction::Forward,
+        )
+        .expect("index cursor");
+    assert_eq!(
+        collect_index(cursor),
+        vec![IndexEntry {
+            value: b"a".to_vec(),
+            document_id: 10,
+            document_value: b"persisted".to_vec(),
+        }]
+    );
+}
+
+#[test]
+fn transaction_document_cursor_merges_recorded_writes() {
+    let (_dir, engine) = open_engine();
+    let (collection, _) = create_collection_and_index(&engine);
+
+    let mut batch = write_set(2);
+    batch.put(collection, 10, b"base-10".to_vec());
+    batch.put(collection, 30, b"base-30".to_vec());
+    batch.put(collection, 40, b"base-40".to_vec());
+    engine.put(batch).expect("write base documents");
+
+    let mut tx = engine.transaction(2).expect("read transaction");
+    tx.delete(collection, 10).expect("record delete");
+    tx.put(collection, 20, b"overlay-20".to_vec())
+        .expect("record insert");
+    tx.put(collection, 30, b"overlay-30".to_vec())
+        .expect("record overwrite");
+
+    let cursor = tx
+        .get_cursor(collection, CursorStart::Unbounded, Direction::Forward)
+        .expect("document cursor");
+    assert_eq!(
+        collect_documents(cursor),
+        vec![
+            document_entry(20, b"overlay-20"),
+            document_entry(30, b"overlay-30"),
+            document_entry(40, b"base-40"),
+        ]
+    );
+
+    let cursor = tx
+        .get_cursor(collection, CursorStart::Included(30), Direction::Reverse)
+        .expect("reverse document cursor");
+    assert_eq!(
+        collect_documents(cursor),
+        vec![
+            document_entry(30, b"overlay-30"),
+            document_entry(20, b"overlay-20"),
+        ]
+    );
+}
+
+#[test]
+fn transaction_index_cursor_merges_recorded_writes() {
+    let (_dir, engine) = open_engine();
+    let (collection, index) = create_collection_and_index(&engine);
+
+    put_index_entries(
+        &engine,
+        2,
+        collection,
+        vec![
+            (index, b"a".to_vec(), 10),
+            (index, b"c".to_vec(), 30),
+            (index, b"d".to_vec(), 40),
+        ],
+    );
+
+    let mut tx = engine.transaction(2).expect("read transaction");
+    tx.delete(collection, 10).expect("record document delete");
+    tx.put(collection, 20, b"doc-20-overlay".to_vec())
+        .expect("record document put");
+    tx.put_index_entry(collection, index, b"b".to_vec(), 20)
+        .expect("record index put");
+    tx.put(collection, 30, b"doc-30-overlay".to_vec())
+        .expect("record document overwrite");
+    tx.delete_index_entry(collection, index, b"d".to_vec(), 40)
+        .expect("record index delete");
+
+    let cursor = tx
+        .get_index_cursor(
+            collection,
+            index,
+            CursorStart::Unbounded,
+            Direction::Forward,
+        )
+        .expect("index cursor");
+    assert_eq!(
+        collect_index(cursor),
+        vec![
+            IndexEntry {
+                value: b"b".to_vec(),
+                document_id: 20,
+                document_value: b"doc-20-overlay".to_vec(),
+            },
+            IndexEntry {
+                value: b"c".to_vec(),
+                document_id: 30,
+                document_value: b"doc-30-overlay".to_vec(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn transaction_index_cursor_uses_recorded_document_visibility_for_base_candidates() {
+    let (_dir, engine) = open_engine();
+    let (collection, index) = create_collection_and_index(&engine);
+
+    put_index_entries(&engine, 2, collection, vec![(index, b"a".to_vec(), 10)]);
+    delete_documents(&engine, 3, collection, vec![10]);
+
+    assert_eq!(
+        index_entries(
+            &engine,
+            3,
+            collection,
+            index,
+            CursorStart::Unbounded,
+            Direction::Forward
+        ),
+        Vec::new()
+    );
+
+    let mut tx = engine.transaction(3).expect("read transaction");
+    tx.put(collection, 10, b"resurrected".to_vec())
+        .expect("record document put");
+
+    let cursor = tx
+        .get_index_cursor(
+            collection,
+            index,
+            CursorStart::Unbounded,
+            Direction::Forward,
+        )
+        .expect("index cursor");
+    assert_eq!(
+        collect_index(cursor),
+        vec![IndexEntry {
+            value: b"a".to_vec(),
+            document_id: 10,
+            document_value: b"resurrected".to_vec(),
+        }]
+    );
+}
+
+#[test]
+fn transaction_catalog_reads_include_recorded_catalog_writes() {
+    let (_dir, engine) = open_engine();
+    let (collection, _) = create_collection_and_index(&engine);
+
+    let mut tx = engine.transaction(1).expect("read transaction");
+    tx.new_collection(-1, "drafts".to_owned())
+        .expect("record collection");
+    tx.update_collection_metadata(collection, b"overlay-docs".to_vec())
+        .expect("record metadata");
+    tx.new_index(-1, -1, "by_status".to_owned(), b"status".to_vec())
+        .expect("record index");
+
+    assert_eq!(
+        tx.collection("drafts").expect("collection lookup"),
+        Some(-1)
+    );
+
+    let cursor = tx
+        .get_collections_catalog_cursor(CursorStart::Unbounded, Direction::Forward)
+        .expect("collections cursor");
+    assert_eq!(
+        collect_collections(cursor),
+        vec![
+            collection_entry(collection, "docs", b"overlay-docs"),
+            collection_entry(-1, "drafts", &[]),
+        ]
+    );
+
+    let mut indexes = tx
+        .get_indexes_catalog_cursor(-1, CursorStart::Unbounded, Direction::Forward)
+        .expect("indexes cursor");
+    assert_eq!(
+        indexes.next().expect("next index"),
+        Some(storage::types::IndexCatalogEntry {
+            collection_id: -1,
+            id: -1,
+            name: "by_status".to_owned(),
+            metadata: b"status".to_vec(),
+        })
+    );
+    assert!(indexes.next().expect("next index").is_none());
+}
+
+#[test]
 fn collection_catalog_is_timestamped() {
     let (_dir, engine) = open_engine();
 
-    engine
-        .put(WriteSet {
-            collections: HashMap::new(),
-            new_collections: vec![(-1, "docs".to_owned())],
-            new_indexes: Vec::new(),
-            ts: 1,
-        })
-        .expect("create collection");
+    let mut batch = write_set(1);
+    batch.new_collection(-1, "docs".to_owned());
+    engine.put(batch).expect("create collection");
 
     let tx = engine.transaction(0).expect("read transaction");
     assert_eq!(tx.collection("docs").expect("collection lookup"), None);
@@ -211,25 +439,9 @@ fn collection_catalog_is_timestamped() {
         vec![collection_entry(collection, "docs", &[])]
     );
 
-    let mut collections = HashMap::new();
-    collections.insert(
-        collection,
-        CollectionWriteSet {
-            documents: Vec::new(),
-            deleted_keys: Vec::new(),
-            index_entries: Vec::new(),
-            deleted_index_entries: Vec::new(),
-            metadata: Some(b"v2".to_vec()),
-        },
-    );
-    engine
-        .put(WriteSet {
-            collections,
-            new_collections: Vec::new(),
-            new_indexes: Vec::new(),
-            ts: 2,
-        })
-        .expect("update collection metadata");
+    let mut batch = write_set(2);
+    batch.update_collection_metadata(collection, b"v2".to_vec());
+    engine.put(batch).expect("update collection metadata");
 
     let tx = engine.transaction(1).expect("read transaction");
     let cursor = tx
@@ -254,18 +466,11 @@ fn collection_catalog_is_timestamped() {
 fn collection_catalog_cursor_scans_name_index_order() {
     let (_dir, engine) = open_engine();
 
-    engine
-        .put(WriteSet {
-            collections: HashMap::new(),
-            new_collections: vec![
-                (-1, "beta".to_owned()),
-                (-2, "alpha".to_owned()),
-                (-3, "gamma".to_owned()),
-            ],
-            new_indexes: Vec::new(),
-            ts: 1,
-        })
-        .expect("create collections");
+    let mut batch = write_set(1);
+    batch.new_collection(-1, "beta".to_owned());
+    batch.new_collection(-2, "alpha".to_owned());
+    batch.new_collection(-3, "gamma".to_owned());
+    engine.put(batch).expect("create collections");
 
     let tx = engine.transaction(1).expect("read transaction");
     let alpha = tx
@@ -328,14 +533,9 @@ fn collection_metadata_update_uses_persistent_id_lookup() {
     let path = dir.path().to_str().expect("utf-8 temp path").to_owned();
     let engine = HeedStorageEngine::open(&path).expect("open heed engine");
 
-    engine
-        .put(WriteSet {
-            collections: HashMap::new(),
-            new_collections: vec![(-1, "docs".to_owned())],
-            new_indexes: Vec::new(),
-            ts: 1,
-        })
-        .expect("create collection");
+    let mut batch = write_set(1);
+    batch.new_collection(-1, "docs".to_owned());
+    engine.put(batch).expect("create collection");
 
     let tx = engine.transaction(1).expect("read transaction");
     let collection = tx
@@ -346,25 +546,9 @@ fn collection_metadata_update_uses_persistent_id_lookup() {
     drop(engine);
 
     let engine = HeedStorageEngine::open(&path).expect("reopen heed engine");
-    let mut collections = HashMap::new();
-    collections.insert(
-        collection,
-        CollectionWriteSet {
-            documents: Vec::new(),
-            deleted_keys: Vec::new(),
-            index_entries: Vec::new(),
-            deleted_index_entries: Vec::new(),
-            metadata: Some(b"after-reopen".to_vec()),
-        },
-    );
-    engine
-        .put(WriteSet {
-            collections,
-            new_collections: Vec::new(),
-            new_indexes: Vec::new(),
-            ts: 2,
-        })
-        .expect("update collection metadata");
+    let mut batch = write_set(2);
+    batch.update_collection_metadata(collection, b"after-reopen".to_vec());
+    engine.put(batch).expect("update collection metadata");
 
     let tx = engine.transaction(2).expect("read transaction");
     let cursor = tx
@@ -380,14 +564,10 @@ fn collection_metadata_update_uses_persistent_id_lookup() {
 fn index_metadata_is_stored_on_creation_and_not_updated() {
     let (_dir, engine) = open_engine();
 
-    engine
-        .put(WriteSet {
-            collections: HashMap::new(),
-            new_collections: vec![(-1, "docs".to_owned())],
-            new_indexes: vec![(-1, -1, "by_value".to_owned(), b"v1".to_vec())],
-            ts: 1,
-        })
-        .expect("create collection and index");
+    let mut batch = write_set(1);
+    batch.new_collection(-1, "docs".to_owned());
+    batch.new_index(-1, -1, "by_value".to_owned(), b"v1".to_vec());
+    engine.put(batch).expect("create collection and index");
 
     let tx = engine.transaction(1).expect("read transaction");
     let collection = tx
@@ -402,14 +582,9 @@ fn index_metadata_is_stored_on_creation_and_not_updated() {
     assert_eq!(created.metadata, b"v1".to_vec());
     assert!(indexes.next().expect("next index").is_none());
 
-    engine
-        .put(WriteSet {
-            collections: HashMap::new(),
-            new_collections: Vec::new(),
-            new_indexes: vec![(collection, -1, "by_value".to_owned(), b"v2".to_vec())],
-            ts: 2,
-        })
-        .expect("recreate existing index");
+    let mut batch = write_set(2);
+    batch.new_index(collection, -1, "by_value".to_owned(), b"v2".to_vec());
+    engine.put(batch).expect("recreate existing index");
 
     let tx = engine.transaction(2).expect("read transaction");
     let mut indexes = tx
@@ -712,28 +887,10 @@ fn put_rejects_batches_with_lower_timestamp() {
     let (collection, index) = create_collection_and_index(&engine);
     engine.set_ts(10).expect("set timestamp");
 
-    let mut collections = HashMap::new();
-    collections.insert(
-        collection,
-        CollectionWriteSet {
-            documents: Vec::new(),
-            deleted_keys: Vec::new(),
-            index_entries: vec![(index, b"stale".to_vec(), 1)],
-            deleted_index_entries: Vec::new(),
-            metadata: None,
-        },
-    );
+    let mut batch = write_set(9);
+    batch.put_index_entry(collection, index, b"stale".to_vec(), 1);
 
-    assert!(
-        engine
-            .put(WriteSet {
-                collections,
-                new_collections: Vec::new(),
-                new_indexes: Vec::new(),
-                ts: 9,
-            })
-            .is_err()
-    );
+    assert!(engine.put(batch).is_err());
     assert_eq!(engine.get_ts().expect("get timestamp"), 10);
     assert_eq!(
         index_entries(

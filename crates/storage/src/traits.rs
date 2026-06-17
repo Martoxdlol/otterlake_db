@@ -104,6 +104,10 @@ pub trait DatastoreTransaction {
         collection_id: CollectionId,
         metadata: Value,
     ) -> Result<()>;
+
+    fn into_write_set(self, ts: u64) -> WriteSet
+    where
+        Self: Sized;
 }
 
 pub trait Datastore: Clone + Send + Sync {

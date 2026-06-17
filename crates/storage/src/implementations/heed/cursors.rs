@@ -318,6 +318,16 @@ impl<'txn, 'env> HeedIndexCursor<'txn, 'env> {
         }
     }
 
+    pub(super) fn next_candidate(&mut self) -> crate::error::Result<Option<IndexCandidate>> {
+        while let Some(entry) = self.next_unfiltered()? {
+            if self.accepts_start(&entry) {
+                return Ok(Some(entry));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn accepts_start(&self, entry: &IndexCandidate) -> bool {
         let position = IndexPosition {
             value: entry.value.clone(),
@@ -371,11 +381,7 @@ impl DatastoreCursor for HeedIndexCursor<'_, '_> {
     type Item = IndexEntry;
 
     fn next(&mut self) -> crate::error::Result<Option<Self::Item>> {
-        while let Some(entry) = self.next_unfiltered()? {
-            if !self.accepts_start(&entry) {
-                continue;
-            }
-
+        while let Some(entry) = self.next_candidate()? {
             if let Some(document_value) = self.visible_document(entry.document_id)? {
                 return Ok(Some(IndexEntry {
                     value: entry.value,
@@ -515,9 +521,9 @@ enum IndexCursorAction {
     Exhausted,
 }
 
-struct IndexCandidate {
-    value: Value,
-    document_id: DocumentId,
+pub(super) struct IndexCandidate {
+    pub(super) value: Value,
+    pub(super) document_id: DocumentId,
 }
 
 enum PendingAction {
