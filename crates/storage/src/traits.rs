@@ -125,4 +125,10 @@ pub trait Datastore: Clone + Send + Sync {
 
     /// Get global timestamp counter
     fn get_ts(&self) -> Result<u64>;
+
+    /// Set visible TS
+    fn set_visible_ts(&self, ts: u64) -> Result<()>;
+
+    /// Get visible TS
+    fn get_visible_ts(&self) -> Result<u64>;
 }

@@ -24,6 +24,7 @@ const METADATA_TS_KEY: &[u8] = &[0x00];
 const METADATA_INDEX_CHAIN_ID_KEY: &[u8] = &[0x01];
 const METADATA_COLLECTION_ID_KEY: &[u8] = &[0x02];
 const METADATA_INDEX_ID_KEY: &[u8] = &[0x03];
+const METADATA_VISIBLE_TS_KEY: &[u8] = &[0x04];
 
 #[derive(Clone)]
 pub struct HeedStorageEngine {
@@ -47,6 +48,7 @@ pub struct HeedStorageEngine {
     pub(super) vacuum_targets: Database<Bytes, Bytes>,
 
     pub(super) ts: Arc<AtomicU64>,
+    pub(super) visible_ts: Arc<AtomicU64>,
     pub(super) collection_id_counter: Arc<AtomicU64>,
     pub(super) collection_id_counter_changed: Arc<AtomicBool>,
     pub(super) index_id_counter: Arc<AtomicU64>,
@@ -110,6 +112,7 @@ impl HeedStorageEngine {
             metadata,
             vacuum_targets,
             ts: Arc::new(AtomicU64::new(0)),
+            visible_ts: Arc::new(AtomicU64::new(0)),
             collection_id_counter: Arc::new(AtomicU64::new(0)),
             collection_id_counter_changed: Arc::new(AtomicBool::new(false)),
             index_id_counter: Arc::new(AtomicU64::new(0)),
@@ -128,6 +131,15 @@ impl HeedStorageEngine {
         self.ts.store(
             self.metadata
                 .get(tx, METADATA_TS_KEY)?
+                .map(decode_u64)
+                .transpose()?
+                .unwrap_or(0),
+            Ordering::SeqCst,
+        );
+
+        self.visible_ts.store(
+            self.metadata
+                .get(tx, METADATA_VISIBLE_TS_KEY)?
                 .map(decode_u64)
                 .transpose()?
                 .unwrap_or(0),
@@ -568,6 +580,19 @@ impl Datastore for HeedStorageEngine {
 
     fn get_ts(&self) -> crate::error::Result<u64> {
         Ok(self.ts.load(Ordering::SeqCst))
+    }
+
+    fn set_visible_ts(&self, ts: u64) -> crate::error::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.visible_ts.store(ts, Ordering::SeqCst);
+        self.metadata
+            .put(&mut wtxn, METADATA_VISIBLE_TS_KEY, &ts.to_be_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn get_visible_ts(&self) -> crate::error::Result<u64> {
+        Ok(self.visible_ts.load(Ordering::SeqCst))
     }
 }
 
