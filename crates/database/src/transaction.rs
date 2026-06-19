@@ -1,9 +1,11 @@
 use storage::types::{CollectionId, DocumentId};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
+use serde::de::DeserializeOwned;
+
 use crate::{
     command::{CommitOutput, TransactionCommand},
-    document::Document,
+    document::{Document, RawDocument, from_document_with_id},
     query::Query,
 };
 
@@ -13,13 +15,31 @@ pub enum TransactionMode {
     ReadWrite,
 }
 
-pub struct Collection {
-    collection_id: CollectionId,
+pub struct Collection<'a> {
+    transaction: &'a Transaction,
+    pub(crate) collection_id: CollectionId,
 }
 
-impl Collection {
-    pub async fn get<T>(self, document_id: DocumentId) -> crate::Result<Option<T>> {
-        todo!()
+impl Collection<'_> {
+    pub async fn get<T: DeserializeOwned>(
+        self,
+        document_id: DocumentId,
+    ) -> crate::Result<Option<T>> {
+        let Some(raw) = self
+            .transaction
+            .get_document(self.collection_id, document_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // TODO: decode the stored blob (`raw.data`) into a `Document` once the
+        // byte codec exists. The blob never carries `_id`; it is grafted back
+        // on below from the requested `document_id`.
+        let document: Document = todo!("decode {} bytes into a Document", raw.data.len());
+
+        let value = from_document_with_id(document, document_id)?;
+        Ok(Some(value))
     }
 }
 
@@ -44,13 +64,41 @@ impl Transaction {
         rx.await?
     }
 
-    pub async fn collection(&self) -> crate::Result<Collection> {
+    pub async fn collection(&self, name: String) -> crate::Result<Collection> {
+        let (tx, rx) = oneshot::channel();
+
+        self.tx.send(TransactionCommand::GetCollection {
+            tx_id: self.tx_id,
+            tx: tx,
+            name: name,
+        })?;
+
+        let coll_id = (rx.await?)?;
+
         Ok(Collection {
-            collection_id: todo!(),
+            transaction: self,
+            collection_id: coll_id,
         })
     }
 
-    pub(crate) async fn query(&self, query: Query) -> crate::Result<Vec<Document>> {
+    pub(crate) async fn get_document(
+        &self,
+        collection_id: CollectionId,
+        document_id: DocumentId,
+    ) -> crate::Result<Option<RawDocument>> {
+        let (tx, rx) = oneshot::channel();
+
+        self.tx.send(TransactionCommand::Get {
+            tx_id: self.tx_id,
+            tx: tx,
+            collection_id,
+            document_id,
+        })?;
+
+        rx.await?
+    }
+
+    pub(crate) async fn query(&self, query: Query) -> crate::Result<Vec<RawDocument>> {
         let (tx, rx) = oneshot::channel();
 
         self.tx.send(TransactionCommand::Query {

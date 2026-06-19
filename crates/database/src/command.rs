@@ -2,7 +2,7 @@ use storage::types::{CollectionId, DocumentId};
 use tokio::sync::{mpsc::error::SendError, oneshot};
 
 use crate::{
-    document::Document,
+    document::RawDocument,
     error::Error,
     query::Query,
     transaction::TransactionMode,
@@ -47,13 +47,13 @@ pub(crate) enum TransactionCommand {
     },
     Get {
         tx_id: u64,
-        tx: oneshot::Sender<crate::Result<Option<Document>>>,
+        tx: oneshot::Sender<crate::Result<Option<RawDocument>>>,
         collection_id: CollectionId,
         document_id: DocumentId,
     },
     Query {
         tx_id: u64,
-        tx: oneshot::Sender<crate::Result<Vec<Document>>>,
+        tx: oneshot::Sender<crate::Result<Vec<RawDocument>>>,
         query: Query,
     },
     Write {

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.89"
+serde = { version = "1.0", features = ["derive"] }
 storage = { path = "../storage" }
 thiserror = "2.0.18"
 tokio = { version = "1.0", features = ["full"] }

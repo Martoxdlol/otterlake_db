@@ -12,6 +12,10 @@ pub mod write_set;
 
 pub use command::{CommitOutput, EndTransactionOutput, RollbackTransactionOutput};
 pub use config::Config;
+pub use document::{
+    Document, DocumentError, RawDocument, Value, from_document, from_document_with_id, to_document,
+    to_value,
+};
 pub use error::{Error, Result};
 pub use database::Database;
 pub use state::DatabaseState;

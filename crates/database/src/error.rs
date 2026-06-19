@@ -8,6 +8,10 @@ pub enum Error {
     #[error(transparent)]
     Storage(#[from] storage::error::Error),
 
+    /// A document failed to encode to or decode from the document data model.
+    #[error(transparent)]
+    Document(#[from] crate::document::DocumentError),
+
     /// A command could not be delivered to (or a response received from) the
     /// transaction worker thread, meaning the worker is gone / shutting down.
     #[error("transaction worker is unavailable")]
