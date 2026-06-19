@@ -483,10 +483,9 @@ impl HeedStorageEngine {
 }
 
 impl Datastore for HeedStorageEngine {
-    fn transaction(
-        &self,
-        ts: u64,
-    ) -> crate::error::Result<impl crate::traits::DatastoreTransaction + '_> {
+    type Transaction<'a> = HeedDatastoreTransaction<'a>;
+
+    fn transaction(&self, ts: u64) -> crate::error::Result<Self::Transaction<'_>> {
         let tx = self.env.read_txn()?;
         Ok(HeedDatastoreTransaction::new(self, tx, ts))
     }

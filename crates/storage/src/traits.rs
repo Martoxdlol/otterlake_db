@@ -111,8 +111,13 @@ pub trait DatastoreTransaction {
 }
 
 pub trait Datastore: Clone + Send + Sync {
+    /// Transaction type produced by [`Datastore::transaction`], borrowing the datastore.
+    type Transaction<'a>: DatastoreTransaction
+    where
+        Self: 'a;
+
     /// Starts a read transaction from version
-    fn transaction(&self, version: u64) -> Result<impl DatastoreTransaction + '_>;
+    fn transaction(&self, version: u64) -> Result<Self::Transaction<'_>>;
 
     /// Apply a set of changes (will be immediately visible to new transactions)
     fn put(&self, batch: WriteSet) -> Result<()>;
