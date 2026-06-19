@@ -2,11 +2,6 @@ use std::ops::Bound;
 
 use storage::types::{CollectionId, IndexId};
 
-pub struct Document {
-    pub _id: Vec<u8>,
-    pub data: Vec<u8>,
-}
-
 pub struct Query {
     pub collection_id: CollectionId,
     pub with_index: Option<WithIndex>,

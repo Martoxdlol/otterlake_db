@@ -1,8 +1,10 @@
 use storage::types::{CollectionId, DocumentId};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc::error::SendError, oneshot};
 
 use crate::{
-    query::{Document, Query},
+    document::Document,
+    error::Error,
+    query::Query,
     transaction::TransactionMode,
 };
 
@@ -30,7 +32,7 @@ pub(crate) enum TransactionCommand {
     },
     CommitTransaction {
         tx_id: u64,
-        tx: oneshot::Sender<CommitOutput>,
+        tx: oneshot::Sender<crate::Result<CommitOutput>>,
         // commit or end (for read and rw transactions)
     },
     RollbackTransaction {
@@ -40,23 +42,30 @@ pub(crate) enum TransactionCommand {
     },
     GetCollection {
         tx_id: u64,
-        tx: oneshot::Sender<Result<CollectionId, Box<dyn std::error::Error>>>,
+        tx: oneshot::Sender<crate::Result<CollectionId>>,
         name: String,
     },
     Get {
         tx_id: u64,
-        tx: oneshot::Sender<Result<Option<Document>, Box<dyn std::error::Error>>>,
+        tx: oneshot::Sender<crate::Result<Option<Document>>>,
         collection_id: CollectionId,
         document_id: DocumentId,
     },
     Query {
         tx_id: u64,
-        tx: oneshot::Sender<Result<Vec<Document>, Box<dyn std::error::Error>>>,
+        tx: oneshot::Sender<crate::Result<Vec<Document>>>,
         query: Query,
     },
     Write {
         tx_id: u64,
-        tx: oneshot::Sender<Result<(), Box<dyn std::error::Error>>>,
+        tx: oneshot::Sender<crate::Result<()>>,
         // write query
     },
+}
+
+/// Failure to enqueue a command means the worker thread has gone away.
+impl From<SendError<TransactionCommand>> for Error {
+    fn from(_: SendError<TransactionCommand>) -> Self {
+        Error::WorkerUnavailable
+    }
 }

@@ -25,7 +25,7 @@ pub struct Database<T: Datastore> {
 }
 
 impl<T: Datastore + 'static> Database<T> {
-    pub async fn new(datastore: T, config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(datastore: T, config: Config) -> crate::Result<Self> {
         let ts = datastore.get_ts()?;
 
         // todo: wal replay
@@ -61,10 +61,7 @@ impl<T: Datastore + 'static> Database<T> {
         })
     }
 
-    pub async fn transaction(
-        &self,
-        mode: TransactionMode,
-    ) -> Result<Transaction, Box<dyn std::error::Error>> {
+    pub async fn transaction(&self, mode: TransactionMode) -> crate::Result<Transaction> {
         let tx_id = self
             .state
             .write()

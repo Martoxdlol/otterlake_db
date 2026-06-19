@@ -3,6 +3,7 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 use crate::{
     command::{CommitOutput, TransactionCommand},
+    document::Document,
     query::Query,
 };
 
@@ -17,10 +18,7 @@ pub struct Collection {
 }
 
 impl Collection {
-    pub async fn get<T>(
-        self,
-        document_id: DocumentId,
-    ) -> Result<Option<T>, Box<dyn std::error::Error>> {
+    pub async fn get<T>(self, document_id: DocumentId) -> crate::Result<Option<T>> {
         todo!()
     }
 }
@@ -33,7 +31,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub async fn commit(self) -> Result<CommitOutput, Box<dyn std::error::Error>> {
+    pub async fn commit(self) -> crate::Result<CommitOutput> {
         let (tx, rx) = oneshot::channel();
 
         self.tx.send(TransactionCommand::CommitTransaction {
@@ -41,19 +39,18 @@ impl Transaction {
             tx,
         })?;
 
-        Ok(rx.await?)
+        // Outer `?` maps a dropped responder to `WorkerUnavailable`; the inner
+        // `Result` carries commit failures such as `Conflict`.
+        rx.await?
     }
 
-    pub async fn collection(&self) -> Result<Collection, Box<dyn std::error::Error>> {
+    pub async fn collection(&self) -> crate::Result<Collection> {
         Ok(Collection {
             collection_id: todo!(),
         })
     }
 
-    pub(crate) async fn query<T>(
-        &self,
-        query: Query,
-    ) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+    pub(crate) async fn query(&self, query: Query) -> crate::Result<Vec<Document>> {
         let (tx, rx) = oneshot::channel();
 
         self.tx.send(TransactionCommand::Query {
@@ -62,7 +59,7 @@ impl Transaction {
             query,
         })?;
 
-        rx.await??
+        rx.await?
     }
 }
 

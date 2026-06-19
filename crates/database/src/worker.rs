@@ -48,6 +48,17 @@ pub(crate) fn run_transaction_thread<D: Datastore>(
             TransactionCommand::RollbackTransaction { tx_id, tx } => {
                 // rollback transaction
             }
+            TransactionCommand::GetCollection { tx_id, tx, name } => {
+                // resolve collection by name
+            }
+            TransactionCommand::Get {
+                tx_id,
+                tx,
+                collection_id,
+                document_id,
+            } => {
+                // get document by id
+            }
             TransactionCommand::Query { tx_id, tx, query } => {
                 // query
             }

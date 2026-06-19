@@ -1,6 +1,8 @@
 pub mod command;
 pub mod config;
 pub mod database;
+pub mod document;
+pub mod error;
 pub mod query;
 pub mod read_set;
 pub mod state;
@@ -10,6 +12,7 @@ pub mod write_set;
 
 pub use command::{CommitOutput, EndTransactionOutput, RollbackTransactionOutput};
 pub use config::Config;
+pub use error::{Error, Result};
 pub use database::Database;
 pub use state::DatabaseState;
 pub use transaction::{Transaction, TransactionMode};
