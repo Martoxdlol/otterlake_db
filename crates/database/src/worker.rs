@@ -48,8 +48,8 @@ pub(crate) fn run_transaction_thread<D: Datastore>(
             TransactionCommand::RollbackTransaction { tx_id, tx } => {
                 // rollback transaction
             }
-            TransactionCommand::Read { tx_id, tx } => {
-                // read query
+            TransactionCommand::Query { tx_id, tx, query } => {
+                // query
             }
             TransactionCommand::Write { tx_id, tx } => {
                 // write query

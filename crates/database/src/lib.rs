@@ -1,6 +1,7 @@
 pub mod command;
 pub mod config;
 pub mod database;
+pub mod query;
 pub mod read_set;
 pub mod state;
 pub mod transaction;

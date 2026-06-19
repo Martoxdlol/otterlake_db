@@ -1,11 +1,28 @@
+use storage::types::{CollectionId, DocumentId};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
-use crate::command::{CommitOutput, TransactionCommand};
+use crate::{
+    command::{CommitOutput, TransactionCommand},
+    query::Query,
+};
 
 #[derive(Clone)]
 pub enum TransactionMode {
     ReadOnly,
     ReadWrite,
+}
+
+pub struct Collection {
+    collection_id: CollectionId,
+}
+
+impl Collection {
+    pub async fn get<T>(
+        self,
+        document_id: DocumentId,
+    ) -> Result<Option<T>, Box<dyn std::error::Error>> {
+        todo!()
+    }
 }
 
 pub struct Transaction {
@@ -25,6 +42,27 @@ impl Transaction {
         })?;
 
         Ok(rx.await?)
+    }
+
+    pub async fn collection(&self) -> Result<Collection, Box<dyn std::error::Error>> {
+        Ok(Collection {
+            collection_id: todo!(),
+        })
+    }
+
+    pub(crate) async fn query<T>(
+        &self,
+        query: Query,
+    ) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+        let (tx, rx) = oneshot::channel();
+
+        self.tx.send(TransactionCommand::Query {
+            tx_id: self.tx_id,
+            tx: tx,
+            query,
+        })?;
+
+        rx.await??
     }
 }
 
