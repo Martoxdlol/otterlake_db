@@ -12,6 +12,10 @@ pub enum Error {
     #[error(transparent)]
     Document(#[from] crate::document::DocumentError),
 
+    /// A [`Value`](crate::document::Value) failed to convert into a concrete type.
+    #[error(transparent)]
+    Conversion(#[from] crate::document::ConversionError),
+
     /// A command could not be delivered to (or a response received from) the
     /// transaction worker thread, meaning the worker is gone / shutting down.
     #[error("transaction worker is unavailable")]

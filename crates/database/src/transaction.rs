@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use crate::{
     command::{CommitOutput, TransactionCommand},
     document::{Document, RawDocument, from_document_with_id},
-    query::Query,
+    query::{Query, builder::QueryBuilder},
 };
 
 #[derive(Clone)]
@@ -18,29 +18,6 @@ pub enum TransactionMode {
 pub struct Collection<'a> {
     transaction: &'a Transaction,
     pub(crate) collection_id: CollectionId,
-}
-
-impl Collection<'_> {
-    pub async fn get<T: DeserializeOwned>(
-        self,
-        document_id: DocumentId,
-    ) -> crate::Result<Option<T>> {
-        let Some(raw) = self
-            .transaction
-            .get_document(self.collection_id, document_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        // TODO: decode the stored blob (`raw.data`) into a `Document` once the
-        // byte codec exists. The blob never carries `_id`; it is grafted back
-        // on below from the requested `document_id`.
-        let document: Document = todo!("decode {} bytes into a Document", raw.data.len());
-
-        let value = from_document_with_id(document, document_id)?;
-        Ok(Some(value))
-    }
 }
 
 pub struct Transaction {
@@ -98,7 +75,11 @@ impl Transaction {
         rx.await?
     }
 
-    pub(crate) async fn query(&self, query: Query) -> crate::Result<Vec<RawDocument>> {
+    pub fn query<S: Into<String>>(&'_ self, collection_name: S) -> QueryBuilder<'_> {
+        QueryBuilder::new(self, collection_name.into())
+    }
+
+    pub(crate) async fn run_query(&self, query: Query) -> crate::Result<Vec<RawDocument>> {
         let (tx, rx) = oneshot::channel();
 
         self.tx.send(TransactionCommand::Query {
@@ -108,6 +89,16 @@ impl Transaction {
         })?;
 
         rx.await?
+    }
+
+    pub(crate) fn mock() -> Self {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tx_id: 0,
+            start_ts: 0,
+            mode: TransactionMode::ReadOnly,
+            tx,
+        }
     }
 }
 

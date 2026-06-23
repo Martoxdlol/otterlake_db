@@ -1,16 +1,21 @@
 use std::ops::Bound;
 
-use storage::types::{CollectionId, IndexId};
+pub mod builder;
 
+pub enum Order {
+    Asc,
+    Desc,
+}
 pub struct Query {
-    pub collection_id: CollectionId,
+    pub collection_name: String,
     pub with_index: Option<WithIndex>,
     pub filter: Option<Filter>,
+    pub order: Option<Order>,
     pub limit: Option<u64>,
 }
 
 pub struct WithIndex {
-    pub index_id: IndexId,
+    pub index_name: String,
     pub lower: Bound<Vec<u8>>,
     pub upper: Bound<Vec<u8>>,
 }

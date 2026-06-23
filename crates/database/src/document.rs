@@ -117,6 +117,299 @@ impl IntoIterator for Document {
     }
 }
 
+impl FromIterator<(String, Value)> for Document {
+    fn from_iter<I: IntoIterator<Item = (String, Value)>>(iter: I) -> Self {
+        let mut doc = Document::new();
+        for (k, v) in iter {
+            doc.insert(k, v);
+        }
+        doc
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ergonomic conversions: Rust primitives -> Value
+// ---------------------------------------------------------------------------
+
+impl From<()> for Value {
+    fn from(_: ()) -> Value {
+        Value::Null
+    }
+}
+
+impl From<bool> for Value {
+    fn from(v: bool) -> Value {
+        Value::Bool(v)
+    }
+}
+
+/// Every integer type that fits losslessly in `i64`.
+macro_rules! impl_from_int {
+    ($($t:ty),* $(,)?) => {$(
+        impl From<$t> for Value {
+            fn from(v: $t) -> Value {
+                Value::I64(v as i64)
+            }
+        }
+    )*};
+}
+impl_from_int!(i8, i16, i32, i64, u8, u16, u32);
+
+impl From<f32> for Value {
+    fn from(v: f32) -> Value {
+        Value::F64(v as f64)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Value {
+        Value::F64(v)
+    }
+}
+
+impl From<String> for Value {
+    fn from(v: String) -> Value {
+        Value::String(v)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Value {
+        Value::String(v.to_string())
+    }
+}
+
+impl From<char> for Value {
+    fn from(v: char) -> Value {
+        Value::String(v.to_string())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Value {
+        Value::Bytes(v)
+    }
+}
+
+impl From<&[u8]> for Value {
+    fn from(v: &[u8]) -> Value {
+        Value::Bytes(v.to_vec())
+    }
+}
+
+// `[T; N]` rather than `Vec<T>`, which would collide with `Vec<u8>` above.
+impl<T: Into<Value>, const N: usize> From<[T; N]> for Value {
+    fn from(v: [T; N]) -> Value {
+        Value::Array(v.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(v: Option<T>) -> Value {
+        match v {
+            Some(v) => v.into(),
+            None => Value::Null,
+        }
+    }
+}
+
+impl<V: Into<Value>> From<std::collections::HashMap<String, V>> for Value {
+    fn from(v: std::collections::HashMap<String, V>) -> Value {
+        Value::Document(v.into_iter().map(|(k, v)| (k, v.into())).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ergonomic conversions: Value -> Rust primitives
+// ---------------------------------------------------------------------------
+
+/// An error produced when converting a [`Value`] into a concrete Rust type fails.
+#[derive(Debug, thiserror::Error)]
+pub enum ConversionError {
+    /// The value's variant has no meaningful conversion into the target type.
+    #[error("cannot convert a {from} value into {into}")]
+    TypeMismatch {
+        from: &'static str,
+        into: &'static str,
+    },
+
+    /// An integer value did not fit in the target type's range.
+    #[error("integer {value} is out of range for {into}")]
+    Overflow { value: i64, into: &'static str },
+
+    /// A string value could not be parsed as the target type.
+    #[error("cannot parse {value:?} as {into}")]
+    Parse { value: String, into: &'static str },
+}
+
+impl Value {
+    /// The name of this value's variant, for diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::I64(_) => "int",
+            Value::F64(_) => "float",
+            Value::String(_) => "string",
+            Value::Bytes(_) => "bytes",
+            Value::Array(_) => "array",
+            Value::Document(_) => "document",
+        }
+    }
+
+    /// Borrow the inner string, if this is a [`Value::String`].
+    ///
+    /// This is the borrowing counterpart to converting into an owned `String`:
+    /// a consuming `Into<&str>` is impossible because the reference would
+    /// dangle once `self` is dropped.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Borrow the inner bytes, if this is a [`Value::Bytes`].
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
+/// Every value renders to a string, so this conversion is total (infallible).
+impl From<Value> for String {
+    fn from(v: Value) -> String {
+        match v {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::I64(i) => i.to_string(),
+            Value::F64(f) => f.to_string(),
+            Value::String(s) => s,
+            Value::Bytes(b) => format!("{:?}", b),
+            Value::Array(a) => format!(
+                "[{}]",
+                a.into_iter()
+                    .map(String::from)
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+            Value::Document(d) => format!(
+                "{{{}}}",
+                d.into_iter()
+                    .map(|(k, v)| format!("{}: {}", k, String::from(v)))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+/// Integers: match wins, floats truncate, bools map to 0/1, strings parse.
+/// Conversions that don't fit the target's range report [`ConversionError::Overflow`].
+macro_rules! impl_try_int {
+    ($($t:ty),* $(,)?) => {$(
+        impl TryFrom<Value> for $t {
+            type Error = ConversionError;
+
+            fn try_from(v: Value) -> Result<Self, ConversionError> {
+                match v {
+                    Value::I64(i) => <$t>::try_from(i)
+                        .map_err(|_| ConversionError::Overflow { value: i, into: stringify!($t) }),
+                    Value::F64(f) => <$t>::try_from(f as i64)
+                        .map_err(|_| ConversionError::Overflow { value: f as i64, into: stringify!($t) }),
+                    Value::Bool(b) => Ok(b as $t),
+                    Value::String(s) => s
+                        .trim()
+                        .parse::<$t>()
+                        .map_err(|_| ConversionError::Parse { value: s, into: stringify!($t) }),
+                    other => Err(ConversionError::TypeMismatch {
+                        from: other.kind(),
+                        into: stringify!($t),
+                    }),
+                }
+            }
+        }
+    )*};
+}
+impl_try_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+
+/// Floats: ints and bools cast, strings parse. No range error (cast saturates).
+macro_rules! impl_try_float {
+    ($($t:ty),* $(,)?) => {$(
+        impl TryFrom<Value> for $t {
+            type Error = ConversionError;
+
+            fn try_from(v: Value) -> Result<Self, ConversionError> {
+                match v {
+                    Value::F64(f) => Ok(f as $t),
+                    Value::I64(i) => Ok(i as $t),
+                    Value::Bool(b) => Ok(if b { 1.0 } else { 0.0 }),
+                    Value::String(s) => s
+                        .trim()
+                        .parse::<$t>()
+                        .map_err(|_| ConversionError::Parse { value: s, into: stringify!($t) }),
+                    other => Err(ConversionError::TypeMismatch {
+                        from: other.kind(),
+                        into: stringify!($t),
+                    }),
+                }
+            }
+        }
+    )*};
+}
+impl_try_float!(f32, f64);
+
+impl TryFrom<Value> for bool {
+    type Error = ConversionError;
+
+    fn try_from(v: Value) -> Result<Self, ConversionError> {
+        match v {
+            Value::Bool(b) => Ok(b),
+            Value::I64(i) => Ok(i != 0),
+            Value::F64(f) => Ok(f != 0.0),
+            Value::String(s) => s
+                .trim()
+                .parse::<bool>()
+                .map_err(|_| ConversionError::Parse { value: s, into: "bool" }),
+            other => Err(ConversionError::TypeMismatch {
+                from: other.kind(),
+                into: "bool",
+            }),
+        }
+    }
+}
+
+impl TryFrom<Value> for char {
+    type Error = ConversionError;
+
+    fn try_from(v: Value) -> Result<Self, ConversionError> {
+        match v {
+            Value::String(s) if s.chars().count() == 1 => Ok(s.chars().next().unwrap()),
+            other => Err(ConversionError::TypeMismatch {
+                from: other.kind(),
+                into: "char",
+            }),
+        }
+    }
+}
+
+impl TryFrom<Value> for Vec<u8> {
+    type Error = ConversionError;
+
+    fn try_from(v: Value) -> Result<Self, ConversionError> {
+        match v {
+            Value::Bytes(b) => Ok(b),
+            Value::String(s) => Ok(s.into_bytes()),
+            other => Err(ConversionError::TypeMismatch {
+                from: other.kind(),
+                into: "Vec<u8>",
+            }),
+        }
+    }
+}
+
 /// Errors produced while converting between application types and documents.
 #[derive(Debug, thiserror::Error)]
 pub enum DocumentError {
