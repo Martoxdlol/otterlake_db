@@ -41,8 +41,9 @@ impl<'a> QueryBuilder<'a> {
     }
 
     /// Pin the scan to an index, restricting the range with a sequence of
-    /// equalities optionally followed by a single range bound. May be used at
-    /// most once, and only as the first stage.
+    /// equalities optionally followed by a lower and/or upper bound on the next
+    /// field (in either order). May be used at most once, and only as the first
+    /// stage.
     pub fn with_index<S, F, R>(self, index_name: S, filter_fn: F) -> QueryBuilderWithIndex<'a>
     where
         S: Into<String>,
@@ -138,76 +139,167 @@ impl<'a> QueryBuilderWithIndex<'a> {
 // ---------------------------------------------------------------------------
 // The index-range filter builder (the `q` in `with_index`).
 //
-// A run of equalities (`eq`) narrows successive index fields and keeps the
-// builder open; a single range bound (`lt`/`gt`/`lte`/`gte`) closes it.
+// Mirrors Convex's index-range grammar: a run of equalities (`eq`) narrowing
+// successive index fields, then an optional lower bound (`gt`/`gte`) and an
+// optional upper bound (`lt`/`lte`) on the next field — each at most once.
+// Unlike Convex, the two bounds may be supplied in either order. The progress
+// is tracked at the type level, so illegal chains (a second equality after a
+// bound, two lower bounds, two upper bounds) do not compile, while every legal
+// prefix is still a finished filter via the `Into<WithIndexFilter>` impls.
 // ---------------------------------------------------------------------------
 
-pub enum WithIndexFilterUnit {
-    LT(String, Value),
-    GT(String, Value),
-    EQ(String, Value),
-    LTE(String, Value),
-    GTE(String, Value),
+/// A lower bound on the range field: `> v` (exclusive) or `>= v` (inclusive).
+enum LowerBound {
+    Gt(Value),
+    Gte(Value),
 }
 
-pub struct WithIndexFilterBuilder {
+/// An upper bound on the range field: `< v` (exclusive) or `<= v` (inclusive).
+enum UpperBound {
+    Lt(Value),
+    Lte(Value),
+}
+
+/// The accumulating parts shared by every index-filter builder stage. Each
+/// bound carries the name of the field it constrains.
+struct IndexFilterState {
     index_name: String,
-    units: Vec<WithIndexFilterUnit>,
+    eq: Vec<(String, Value)>,
+    lower: Option<(String, LowerBound)>,
+    upper: Option<(String, UpperBound)>,
+}
+
+/// Open stage: accepts further equalities and either bound (in either order).
+pub struct WithIndexFilterBuilder {
+    state: IndexFilterState,
+}
+
+/// Stage after a lower bound: only an upper bound may still be added.
+pub struct WithIndexLowerBounded {
+    state: IndexFilterState,
+}
+
+/// Stage after an upper bound: only a lower bound may still be added.
+pub struct WithIndexUpperBounded {
+    state: IndexFilterState,
 }
 
 impl WithIndexFilterBuilder {
     pub fn new(index_name: String) -> Self {
         Self {
-            index_name,
-            units: Vec::new(),
+            state: IndexFilterState {
+                index_name,
+                eq: Vec::new(),
+                lower: None,
+                upper: None,
+            },
         }
     }
 
+    /// Narrow the next index field to an exact value, keeping the builder open.
     pub fn eq<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
-        self.units
-            .push(WithIndexFilterUnit::EQ(key.into(), value.into()));
+        self.state.eq.push((key.into(), value.into()));
         self
     }
 
-    pub fn lt<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
-        self.units
-            .push(WithIndexFilterUnit::LT(key.into(), value.into()));
-        self.into()
+    /// Bound the range field from below (exclusive); an upper bound may follow.
+    pub fn gt<K: Into<String>, V: Into<Value>>(
+        mut self,
+        key: K,
+        value: V,
+    ) -> WithIndexLowerBounded {
+        self.state.lower = Some((key.into(), LowerBound::Gt(value.into())));
+        WithIndexLowerBounded { state: self.state }
     }
 
-    pub fn gt<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
-        self.units
-            .push(WithIndexFilterUnit::GT(key.into(), value.into()));
-        self.into()
+    /// Bound the range field from below (inclusive); an upper bound may follow.
+    pub fn gte<K: Into<String>, V: Into<Value>>(
+        mut self,
+        key: K,
+        value: V,
+    ) -> WithIndexLowerBounded {
+        self.state.lower = Some((key.into(), LowerBound::Gte(value.into())));
+        WithIndexLowerBounded { state: self.state }
     }
 
-    pub fn lte<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
-        self.units
-            .push(WithIndexFilterUnit::LTE(key.into(), value.into()));
-        self.into()
+    /// Bound the range field from above (exclusive); a lower bound may follow.
+    pub fn lt<K: Into<String>, V: Into<Value>>(
+        mut self,
+        key: K,
+        value: V,
+    ) -> WithIndexUpperBounded {
+        self.state.upper = Some((key.into(), UpperBound::Lt(value.into())));
+        WithIndexUpperBounded { state: self.state }
     }
 
-    pub fn gte<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
-        self.units
-            .push(WithIndexFilterUnit::GTE(key.into(), value.into()));
-        self.into()
+    /// Bound the range field from above (inclusive); a lower bound may follow.
+    pub fn lte<K: Into<String>, V: Into<Value>>(
+        mut self,
+        key: K,
+        value: V,
+    ) -> WithIndexUpperBounded {
+        self.state.upper = Some((key.into(), UpperBound::Lte(value.into())));
+        WithIndexUpperBounded { state: self.state }
     }
 }
 
-/// An all-equality index filter never closes the builder, so it converts
-/// straight into the finished filter.
+impl WithIndexLowerBounded {
+    /// Close the range with an upper bound (exclusive).
+    pub fn lt<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
+        self.state.upper = Some((key.into(), UpperBound::Lt(value.into())));
+        WithIndexFilter { state: self.state }
+    }
+
+    /// Close the range with an upper bound (inclusive).
+    pub fn lte<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
+        self.state.upper = Some((key.into(), UpperBound::Lte(value.into())));
+        WithIndexFilter { state: self.state }
+    }
+}
+
+impl WithIndexUpperBounded {
+    /// Close the range with a lower bound (exclusive).
+    pub fn gt<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
+        self.state.lower = Some((key.into(), LowerBound::Gt(value.into())));
+        WithIndexFilter { state: self.state }
+    }
+
+    /// Close the range with a lower bound (inclusive).
+    pub fn gte<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> WithIndexFilter {
+        self.state.lower = Some((key.into(), LowerBound::Gte(value.into())));
+        WithIndexFilter { state: self.state }
+    }
+}
+
+/// Every builder stage is itself a valid finished filter — all-equality (no
+/// bound), lower-only, upper-only, or both — so `with_index`'s closure may
+/// return whichever stage it happens to end on.
 impl From<WithIndexFilterBuilder> for WithIndexFilter {
     fn from(builder: WithIndexFilterBuilder) -> Self {
         WithIndexFilter {
-            index_name: builder.index_name,
-            units: builder.units,
+            state: builder.state,
+        }
+    }
+}
+
+impl From<WithIndexLowerBounded> for WithIndexFilter {
+    fn from(builder: WithIndexLowerBounded) -> Self {
+        WithIndexFilter {
+            state: builder.state,
+        }
+    }
+}
+
+impl From<WithIndexUpperBounded> for WithIndexFilter {
+    fn from(builder: WithIndexUpperBounded) -> Self {
+        WithIndexFilter {
+            state: builder.state,
         }
     }
 }
 
 pub struct WithIndexFilter {
-    pub index_name: String,
-    pub units: Vec<WithIndexFilterUnit>,
+    state: IndexFilterState,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,23 +484,6 @@ fn filter_expr_to_filter(expr: FilterExpr) -> Result<Filter> {
     })
 }
 
-/// A single trailing range bound on the index (the unit that closes the `eq`
-/// prefix).
-enum RangeBound {
-    Gt(Value),
-    Gte(Value),
-    Lt(Value),
-    Lte(Value),
-}
-
-impl RangeBound {
-    fn value(&self) -> &Value {
-        match self {
-            RangeBound::Gt(v) | RangeBound::Gte(v) | RangeBound::Lt(v) | RangeBound::Lte(v) => v,
-        }
-    }
-}
-
 /// Pair a bound with the names of the index fields its bytes encode, in index
 /// order — this is what lets the worker check the bound against the resolved
 /// index definition. An unbounded end constrains nothing, so it carries no
@@ -422,36 +497,28 @@ fn attach(names: Vec<String>, bound: Bound<Vec<u8>>) -> (Vec<String>, Bound<Vec<
 
 /// Encode the index filter into a `[lower, upper)`-style key range.
 ///
-/// The equality units form a shared key prefix; an optional trailing range unit
-/// bounds the next field. With no range, the result is a prefix scan over all
-/// entries sharing the equality prefix. Each bound is tagged with the names of
-/// the fields its bytes encode (the eq prefix, plus the range field on the side
-/// the range constrains), so the worker can verify them against the index.
+/// The equality fields form a shared key prefix; an optional lower and/or upper
+/// bound constrains the next field. A side with no explicit bound falls back to
+/// the corresponding end of the equality prefix, so with no bounds at all the
+/// result is a prefix scan over every entry sharing that prefix. Each end is
+/// tagged with the names of the fields its bytes encode (the eq prefix, plus
+/// the range field on a bounded side), so the worker can verify them against
+/// the index.
 fn build_with_index(filter: WithIndexFilter) -> Result<WithIndex> {
-    let WithIndexFilter { index_name, units } = filter;
+    let IndexFilterState {
+        index_name,
+        eq,
+        lower,
+        upper,
+    } = filter.state;
 
-    let mut eq_fields: Vec<String> = Vec::new();
-    let mut eq_values: Vec<Value> = Vec::new();
-    let mut range: Option<(String, RangeBound)> = None;
-    for unit in units {
-        match unit {
-            WithIndexFilterUnit::EQ(f, v) => {
-                eq_fields.push(f);
-                eq_values.push(v);
-            }
-            WithIndexFilterUnit::GT(f, v) => range = Some((f, RangeBound::Gt(v))),
-            WithIndexFilterUnit::GTE(f, v) => range = Some((f, RangeBound::Gte(v))),
-            WithIndexFilterUnit::LT(f, v) => range = Some((f, RangeBound::Lt(v))),
-            WithIndexFilterUnit::LTE(f, v) => range = Some((f, RangeBound::Lte(v))),
-        }
-    }
-
-    let prefix_fields: Vec<Option<&Value>> = eq_values.iter().map(Some).collect();
+    let eq_fields: Vec<String> = eq.iter().map(|(f, _)| f.clone()).collect();
+    let prefix_fields: Vec<Option<&Value>> = eq.iter().map(|(_, v)| Some(v)).collect();
     let prefix = encode_entry(&prefix_fields)?;
-    let has_prefix = !eq_values.is_empty();
+    let has_prefix = !eq.is_empty();
 
-    // The half-open ends of the equality prefix alone, used to bound whichever
-    // side of a range stays open (or both sides when there is no range).
+    // The half-open ends of the equality prefix alone, used for whichever side
+    // of the range has no explicit bound (or both sides when there is none).
     let prefix_start = if has_prefix {
         Bound::Included(prefix.clone())
     } else {
@@ -462,37 +529,43 @@ fn build_with_index(filter: WithIndexFilter) -> Result<WithIndex> {
         None => Bound::Unbounded,
     };
 
-    let (lower, upper) = match range {
-        None => (
-            attach(eq_fields.clone(), prefix_start),
-            attach(eq_fields, prefix_end),
-        ),
-        Some((range_field, range)) => {
-            let range_key = {
-                let mut fields = prefix_fields;
-                fields.push(Some(range.value()));
-                encode_entry(&fields)?
+    // Encode the equality prefix followed by the range field's value.
+    let range_key = |value: &Value| -> Result<Vec<u8>> {
+        let mut fields = prefix_fields.clone();
+        fields.push(Some(value));
+        Ok(encode_entry(&fields)?)
+    };
+
+    // A bounded side adds the range field's name; an open side keeps the eq
+    // prefix names (and `attach` drops them entirely when the bound is open-ended).
+    let lower = match lower {
+        None => attach(eq_fields.clone(), prefix_start),
+        Some((field, bound)) => {
+            let mut names = eq_fields.clone();
+            names.push(field);
+            let key = match &bound {
+                LowerBound::Gt(v) | LowerBound::Gte(v) => range_key(v)?,
             };
-            let mut range_names = eq_fields.clone();
-            range_names.push(range_field);
-            match range {
-                RangeBound::Gt(_) => (
-                    attach(range_names, Bound::Excluded(range_key)),
-                    attach(eq_fields, prefix_end),
-                ),
-                RangeBound::Gte(_) => (
-                    attach(range_names, Bound::Included(range_key)),
-                    attach(eq_fields, prefix_end),
-                ),
-                RangeBound::Lt(_) => (
-                    attach(eq_fields, prefix_start),
-                    attach(range_names, Bound::Excluded(range_key)),
-                ),
-                RangeBound::Lte(_) => (
-                    attach(eq_fields, prefix_start),
-                    attach(range_names, Bound::Included(range_key)),
-                ),
-            }
+            let bound = match bound {
+                LowerBound::Gt(_) => Bound::Excluded(key),
+                LowerBound::Gte(_) => Bound::Included(key),
+            };
+            attach(names, bound)
+        }
+    };
+    let upper = match upper {
+        None => attach(eq_fields, prefix_end),
+        Some((field, bound)) => {
+            let mut names = eq_fields;
+            names.push(field);
+            let key = match &bound {
+                UpperBound::Lt(v) | UpperBound::Lte(v) => range_key(v)?,
+            };
+            let bound = match bound {
+                UpperBound::Lt(_) => Bound::Excluded(key),
+                UpperBound::Lte(_) => Bound::Included(key),
+            };
+            attach(names, bound)
         }
     };
 
@@ -672,6 +745,29 @@ mod test {
             .filter(|q| q.eq("author", "ada"))
             .filter(|q| q.or([q.eq("pinned", true), q.gte("score", 10)]))
             .order(Order::Desc);
+    }
+
+    /// A two-sided range on the index field, given in either order — both must
+    /// type-check and both ends are constrained.
+    #[test]
+    fn builds_two_sided_index_range() {
+        let tx = Transaction::mock();
+
+        // Convex's canonical order: lower bound, then upper bound.
+        let _lower_first = tx
+            .query("books")
+            .with_index("by_author_title", |q| {
+                q.eq("author", "Isaac Asimov").gte("title", "F").lt("title", "G")
+            })
+            .collect();
+
+        // The reverse order is equally valid here.
+        let _upper_first = tx
+            .query("books")
+            .with_index("by_author_title", |q| {
+                q.eq("author", "Isaac Asimov").lt("title", "G").gte("title", "F")
+            })
+            .collect();
     }
 
     #[test]
