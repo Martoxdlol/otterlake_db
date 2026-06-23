@@ -16,8 +16,8 @@ pub struct Query {
 
 pub struct WithIndex {
     pub index_name: String,
-    pub lower: Bound<Vec<u8>>,
-    pub upper: Bound<Vec<u8>>,
+    pub lower: (Vec<String>, Bound<Vec<u8>>),
+    pub upper: (Vec<String>, Bound<Vec<u8>>),
 }
 
 pub enum Filter {

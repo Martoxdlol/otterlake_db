@@ -16,6 +16,10 @@ pub enum Error {
     #[error(transparent)]
     Conversion(#[from] crate::document::ConversionError),
 
+    /// A value could not be encoded into an order-preserving index key.
+    #[error(transparent)]
+    Encoding(#[from] crate::encoding::EncodingError),
+
     /// A command could not be delivered to (or a response received from) the
     /// transaction worker thread, meaning the worker is gone / shutting down.
     #[error("transaction worker is unavailable")]

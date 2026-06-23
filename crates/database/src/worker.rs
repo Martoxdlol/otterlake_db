@@ -54,7 +54,7 @@ pub(crate) fn run_transaction_thread<D: Datastore>(
             TransactionCommand::Get {
                 tx_id,
                 tx,
-                collection_id,
+                collection_name,
                 document_id,
             } => {
                 // get document by id

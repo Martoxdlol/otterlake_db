@@ -2,6 +2,7 @@ pub mod command;
 pub mod config;
 pub mod database;
 pub mod document;
+pub mod encoding;
 pub mod error;
 pub mod query;
 pub mod read_set;

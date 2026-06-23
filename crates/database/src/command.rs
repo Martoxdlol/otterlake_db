@@ -1,12 +1,7 @@
 use storage::types::{CollectionId, DocumentId};
 use tokio::sync::{mpsc::error::SendError, oneshot};
 
-use crate::{
-    document::RawDocument,
-    error::Error,
-    query::Query,
-    transaction::TransactionMode,
-};
+use crate::{document::Document, error::Error, query::Query, transaction::TransactionMode};
 
 pub struct EndTransactionOutput {
     // commit or end (for read and rw transactions)
@@ -47,13 +42,13 @@ pub(crate) enum TransactionCommand {
     },
     Get {
         tx_id: u64,
-        tx: oneshot::Sender<crate::Result<Option<RawDocument>>>,
-        collection_id: CollectionId,
+        tx: oneshot::Sender<crate::Result<Option<Document>>>,
+        collection_name: String,
         document_id: DocumentId,
     },
     Query {
         tx_id: u64,
-        tx: oneshot::Sender<crate::Result<Vec<RawDocument>>>,
+        tx: oneshot::Sender<crate::Result<Vec<Document>>>,
         query: Query,
     },
     Write {

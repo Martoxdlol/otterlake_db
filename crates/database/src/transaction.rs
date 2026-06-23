@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     command::{CommitOutput, TransactionCommand},
-    document::{Document, RawDocument, from_document_with_id},
+    document::Document,
     query::{Query, builder::QueryBuilder},
 };
 
@@ -60,16 +60,16 @@ impl Transaction {
 
     pub(crate) async fn get_document(
         &self,
-        collection_id: CollectionId,
+        collection_name: String,
         document_id: DocumentId,
-    ) -> crate::Result<Option<RawDocument>> {
+    ) -> crate::Result<Option<Document>> {
         let (tx, rx) = oneshot::channel();
 
         self.tx.send(TransactionCommand::Get {
             tx_id: self.tx_id,
             tx: tx,
-            collection_id,
-            document_id,
+            collection_name: collection_name,
+            document_id: document_id,
         })?;
 
         rx.await?
@@ -79,7 +79,7 @@ impl Transaction {
         QueryBuilder::new(self, collection_name.into())
     }
 
-    pub(crate) async fn run_query(&self, query: Query) -> crate::Result<Vec<RawDocument>> {
+    pub(crate) async fn run_query(&self, query: Query) -> crate::Result<Vec<Document>> {
         let (tx, rx) = oneshot::channel();
 
         self.tx.send(TransactionCommand::Query {
